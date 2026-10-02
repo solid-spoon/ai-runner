@@ -4,17 +4,32 @@ on: [push, pull_request]
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact: build/Release/airun.exe
+            name: windows-x64
+          - os: ubuntu-latest
+            artifact: build/airun
+            name: linux-x64
+          - os: macos-13
+            artifact: build/airun
+            name: macos-x64
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: lukka/get-cmake@latest
+
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
       - name: Build
         run: cmake --build build --config Release
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
         with:
-          name: airun-${{ matrix.os }}
-          path: build/Release/airun* 
+          name: airun-${{ matrix.name }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
