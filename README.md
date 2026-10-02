@@ -44,7 +44,7 @@
   you > 用 Python 编写一个简单的快速排序算法实现。
   aI  > 下面是一个使用 Python 实现的简单快速排序算法示例：
 
-```python
+``python
 def quick_sort(arr):
     if len(arr) <= 1:
         return arr
@@ -60,7 +60,7 @@ def quick_sort(arr):
 arr = [3, 6, 8, 10, 1, 2, 1]
 sorted_arr = quick_sort(arr)
 print("排序后的数组:", sorted_arr)
-```
+``
 
 这个函数接受一个列表作为输入，返回一个按升序排列的新列表。快速排序算法的工作原理是选择一个“基准”元素（这里选择的是数组的中间元素），将所有比这个基准值大的元素移动到它的左边，剩下的都移到右边。然后重复这个过程直到所有元素都被排序。
   prefill 22 new (cached 43) | 664 ms   |   gen 213 tok | 13791 ms | 15.4 tok/s
