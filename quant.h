@@ -61,10 +61,18 @@ inline Int8Tensor quantize_per_channel(const std::vector<float>& fp32,
 }
 
 // Vectorized int8 dot product.
-// SSE2: 16 int8/iter.  AVX1: 32 int8/iter.
+//   SSE2  : 16 int8 per iteration (works everywhere on x86_64)
+//   AVX2  : 32 int8 per iteration (needs Haswell+; Pentium/Celeron
+//           Kaby/Coffee Lake and older CPUs lack AVX2 and will use SSE2)
+//
+// NOTE: 256-bit *integer* intrinsics (_mm256_srai_epi16, _mm256_madd_epi16,
+// _mm256_unpacklo_epi8, _mm256_add_epi32, ...) belong to AVX2, NOT AVX1.
+// That is why the gate below is `__AVX2__`, not `__AVX__`. With `-mavx`
+// on an AVX1-only CPU the AVX2 branch is compiled out and the SSE2 path
+// is used instead.
 inline int32_t dot_int8_scalar(const int8_t* __restrict a,
     const int8_t* __restrict b, int n) {
-#if defined(__AVX__)
+#if defined(__AVX2__)
     __m256i acc = _mm256_setzero_si256();
     int i = 0;
     for (; i + 32 <= n; i += 32) {
@@ -97,7 +105,8 @@ inline int32_t dot_int8_scalar(const int8_t* __restrict a,
         total += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
     return total;
 #else
-    // SSE2 fallback (unchanged).
+    // SSE2 fallback — used on AVX1-only CPUs (Kaby/Coffee Lake Pentium,
+    // Celeron, Sandy/Ivy Bridge, ...). 16 int8 per iteration.
     __m128i acc = _mm_setzero_si128();
     int i = 0;
     for (; i + 16 <= n; i += 16) {
