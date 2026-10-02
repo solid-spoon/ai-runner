@@ -26,33 +26,7 @@ else()
     target_link_libraries(airun PRIVATE Threads::Threads)
 endif()
 
-option(AIRUN_AVX "Enable AVX" OFF)
-option(AIRUN_AVX2 "Enable AVX2" OFF)
-
-if(AIRUN_AVX)
-    if(MSVC)
-        target_compile_options(airun PRIVATE /arch:AVX)
-    else()
-        target_compile_options(airun PRIVATE -mavx)
-    endif()
-    target_compile_definitions(airun PRIVATE AIRUN_HAVE_AVX=1)
-endif()
-
-if(AIRUN_AVX2)
-    if(MSVC)
-        target_compile_options(airun PRIVATE /arch:AVX2)
-    else()
-        target_compile_options(airun PRIVATE -mavx2 -mfma)
-    endif()
-    target_compile_definitions(airun PRIVATE AIRUN_HAVE_AVX2=1)
-endif()
-
 target_sources(airun PRIVATE
-    st.h
-    tokenizer.h
-    matmul.h
-    model.h
-    sampler.h
-    agent.h
-    ui.h
+    st.h st_writer.h tokenizer.h matmul.h quant.h
+    model.h sampler.h agent.h ui.h
 )

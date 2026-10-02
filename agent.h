@@ -1,4 +1,4 @@
-// cpp/agent.h — Qwen2 chat agent driving the TUI.
+// cpp/agent.h — Qwen2 chat agent driving the TUI, with prefix caching.
 #pragma once
 
 #include "model.h"
@@ -11,6 +11,7 @@
 #include <vector>
 #include <chrono>
 #include <sstream>
+#include <algorithm>
 
 namespace tok_id {
     inline constexpr int kImStart = 151644;
@@ -30,10 +31,15 @@ public:
 
     void set_config(const SamplerConfig& c) { cfg_ = c; }
     const SamplerConfig& config() const { return cfg_; }
-    void clear_history() { history_.clear(); }
 
-    // Builds the ChatML prompt for the given system + user input,
-    // appending the full conversation history.
+    // Clears both the dialogue history AND the KV cache tracker, so the
+    // next generate() call falls back to a full prefill.
+    void clear_history() {
+        history_.clear();
+        cached_ids_.clear();
+        model_.reset_kv();
+    }
+
     std::string build_prompt(const std::string& system,
         const std::string& user_input) const {
         std::ostringstream s;
@@ -45,30 +51,56 @@ public:
         return s.str();
     }
 
-    // Runs prefill on the prompt, then autoregressively samples up to
-    // max_tokens new tokens. Streams the output to the UI.
     std::string generate(const std::string& system_prompt,
         const std::string& user_input,
         int max_tokens = 1024) {
-        const std::string prompt = build_prompt(system_prompt, user_input);
-        const auto ids = tok_.encode(prompt);
-        model_.reset_kv();
 
-        // Prefill in small chunks so the spinner can update.
+        const std::string prompt = build_prompt(system_prompt, user_input);
+        const std::vector<int> ids = tok_.encode(prompt);
+
+        // ??? 1. PREFIX MATCH ???????????????????????????????????????
+        // How many leading tokens of the new prompt are already sitting
+        // in the KV cache?
+        size_t prefix = 0;
+        const size_t min_len = std::min(cached_ids_.size(), ids.size());
+        while (prefix < min_len && cached_ids_[prefix] == ids[prefix]) {
+            ++prefix;
+        }
+
+        // We can't truncate the KV cache in place, and we always need at
+        // least one fresh token so the final logits are valid. If either
+        // condition is violated, nuke everything and start over.
+        if (cached_ids_.size() > prefix || prefix >= ids.size()) {
+            model_.reset_kv();
+            cached_ids_.clear();
+            prefix = 0;
+        }
+
+        const int n_cached = static_cast<int>(prefix);
+        const int n_new = static_cast<int>(ids.size() - prefix);
+
+        // ??? 2. PREFILL (suffix only) ???????????????????????????????
         ui::Spinner spinner;
-        spinner.start("thinking...");
-        spinner.set_progress(0, static_cast<int>(ids.size()));
+        if (n_cached > 0) {
+            char lbl[64];
+            std::snprintf(lbl, sizeof(lbl),
+                "prefilling (cached %d)...", n_cached);
+            spinner.start(lbl);
+        }
+        else {
+            spinner.start("thinking...");
+        }
+        spinner.set_progress(0, n_new);
 
         const auto t0 = std::chrono::high_resolution_clock::now();
         const float* logits = nullptr;
 
         constexpr int kPrefillChunk = 32;
-        for (size_t start = 0; start < ids.size(); start += kPrefillChunk) {
+        for (size_t start = prefix; start < ids.size(); start += kPrefillChunk) {
             const size_t end = std::min(start + kPrefillChunk, ids.size());
             std::vector<int> chunk(ids.begin() + start, ids.begin() + end);
             logits = model_.forward_batch(chunk);
-            spinner.set_progress(static_cast<int>(end),
-                static_cast<int>(ids.size()));
+            spinner.set_progress(static_cast<int>(end - prefix), n_new);
         }
 
         const auto t1 = std::chrono::high_resolution_clock::now();
@@ -76,7 +108,7 @@ public:
             std::chrono::duration<double, std::milli>(t1 - t0).count();
         spinner.stop();
 
-        // Generation loop.
+        // ??? 3. GENERATION ??????????????????????????????????????????
         ui::ai_msg_begin();
 
         std::vector<int> generated;
@@ -105,13 +137,32 @@ public:
 
         ui::ai_msg_end();
 
-        char stat[192];
-        std::snprintf(stat, sizeof(stat),
-            "prefill %zu tok | %.0f ms   |   gen %zu tok | %.0f ms | %.1f tok/s",
-            ids.size(), prefill_ms, generated.size(), gen_ms, tps);
+        // ??? 4. STATS ???????????????????????????????????????????????
+        char stat[256];
+        if (n_cached > 0) {
+            std::snprintf(stat, sizeof(stat),
+                "prefill %d new (cached %d) | %.0f ms   |   gen %zu tok | %.0f ms | %.1f tok/s",
+                n_new, n_cached, prefill_ms,
+                generated.size(), gen_ms, tps);
+        }
+        else {
+            std::snprintf(stat, sizeof(stat),
+                "prefill %d tok | %.0f ms   |   gen %zu tok | %.0f ms | %.1f tok/s",
+                n_new, prefill_ms,
+                generated.size(), gen_ms, tps);
+        }
         ui::info(stat);
 
-        // Append this turn to history and cap the rolling window.
+        // ??? 5. TRACK WHAT'S NOW IN THE KV CACHE ???????????????????
+        // KV holds: every prompt token + every generated token.
+        // (The stopping token is sampled but never forwarded, so it's
+        //  not part of the cache — matching the next prompt's prefix
+        //  logic, which sees <|im_end|> as the first "new" token.)
+        cached_ids_ = ids;
+        cached_ids_.insert(cached_ids_.end(),
+            generated.begin(), generated.end());
+
+        // ??? 6. UPDATE HISTORY ??????????????????????????????????????
         history_.push_back({ "user", user_input });
         history_.push_back({ "assistant", tok_.decode(generated) });
         while (history_.size() > 6) history_.erase(history_.begin());
@@ -125,17 +176,14 @@ private:
     Sampler sampler_;
     SamplerConfig cfg_;
     std::vector<ChatTurn> history_;
+    std::vector<int> cached_ids_;
 };
 
-// ??? Interactive REPL ????????????????????????????????????????????
+// ??? Interactive REPL ???????????????????????????????????????????
 inline void run_agent(Qwen2Model& model, Qwen2Tokenizer& tok) {
-    // The assistant is instructed to mirror the user's language, so
-    // Chinese prompts get Chinese answers without any extra plumbing.
     const std::string kSystemPrompt =
         "You are a helpful, concise AI assistant. "
-        "Always answer in the same language the user writes in: "
-        "if the user writes in Chinese, reply in Chinese; "
-        "if in English, reply in English; etc.";
+        "Always answer in the same language the user writes in.";
 
     QwenAgent agent(model, tok);
     SamplerConfig cfg;
@@ -146,12 +194,9 @@ inline void run_agent(Qwen2Model& model, Qwen2Tokenizer& tok) {
 
     std::string line;
     while (true) {
-        // Print the prompt, then read the user's line. The terminal echoes
-        // the typed text itself, so no separate user_msg print is needed.
         ui::prompt();
         if (!ui::read_user_line(line)) break;
 
-        // Trim surrounding whitespace.
         const size_t first = line.find_first_not_of(" \t\r\n");
         if (first == std::string::npos) continue;
         const size_t last = line.find_last_not_of(" \t\r\n");
@@ -164,7 +209,7 @@ inline void run_agent(Qwen2Model& model, Qwen2Tokenizer& tok) {
         }
         if (line == "/reset") {
             agent.clear_history();
-            ui::notice("history cleared");
+            ui::notice("history + KV cache cleared");
             continue;
         }
         if (line == "/clear") {
@@ -177,11 +222,11 @@ inline void run_agent(Qwen2Model& model, Qwen2Tokenizer& tok) {
             continue;
         }
         if (line == "/help") {
-            ui::info("/reset          clear conversation history");
+            ui::info("/reset          clear conversation history + KV cache");
             ui::info("/clear          clear screen");
             ui::info("/temp <n>       set temperature (0.1 - 2.0)");
             ui::info("/exit           quit");
-            ui::info("Tip: you can type prompts in any language, including ??.");
+            ui::info("Tip: follow-up questions reuse the KV cache and are much faster.");
             continue;
         }
         if (line.rfind("/temp ", 0) == 0) {

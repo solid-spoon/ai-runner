@@ -1,8 +1,12 @@
-// cpp/model.h — Qwen2 forward pass (FP32 weights, single-token + batched prefill).
+// cpp/model.h — Qwen2 forward pass.
+// Linear weights can be either:
+//   (a) pre-quantized INT8 (loaded from *.scale-keyed safetensors) — fast path
+//   (b) FP32/BF16 (original model) — quantized on the fly at load time
 #pragma once
 
 #include "st.h"
 #include "matmul.h"
+#include "quant.h"
 
 #include <cstdio>
 #include <cstring>
@@ -22,7 +26,6 @@ struct Qwen2Config {
     int   max_position_embeddings = 32768;
 };
 
-// Scratch buffers are preallocated to these bounds.
 inline constexpr int kMaxPrefill = 1024;
 inline constexpr int kMaxContext = 8192;
 
@@ -30,37 +33,34 @@ class Qwen2Model {
 public:
     Qwen2Config cfg;
 
-    // Derived dimensions, cached for convenience.
     int H, NH, NKV, NL, HD, KVD, INTER, VOCAB, GROUPS;
     float RMS_EPS, ROPE_THETA;
 
-    // Global tensors.
     std::vector<float> embed;
     std::vector<float> finalNorm;
 
     struct Layer {
         std::vector<float> inputNorm;
-        std::vector<float> q_w, q_b;
-        std::vector<float> k_w, k_b;
-        std::vector<float> v_w, v_b;
-        std::vector<float> o_w;
         std::vector<float> postNorm;
-        std::vector<float> gate_w, up_w, down_w;
+
+        Int8Tensor q_w, k_w, v_w, o_w;
+        std::vector<float> q_b, k_b, v_b;
+
+        Int8Tensor gate_w, up_w, down_w;
     };
     std::vector<Layer> layers;
 
-    // KV cache: [layer][seq_pos][channel].
     std::vector<std::vector<std::vector<float>>> kv_k;
     std::vector<std::vector<std::vector<float>>> kv_v;
 
-    // Single-token scratch buffers.
+    // Single-token scratch.
     std::vector<float> x, xNorm;
     std::vector<float> q, k, v, attnOut, oProj;
     std::vector<float> gate, up, mlp;
     std::vector<float> logits;
     std::vector<float> scores;
 
-    // Batched (prefill) scratch buffers.
+    // Batched (prefill) scratch.
     std::vector<float> Xb, Xnb, Qb, Kb, Vb, AttnOutb, OProjb;
     std::vector<float> Gateb, Upb, Mlb;
     std::vector<float> scores_buf;
@@ -87,6 +87,42 @@ public:
             return SafeTensors::to_f32(st[name]);
         };
 
+        // Pre-quantized int8 tensor with a companion `.scale` tensor.
+        auto load_int8 = [&](const std::string& name,
+            int rows, int cols) -> Int8Tensor {
+                Int8Tensor t;
+                t.rows = rows;
+                t.cols = cols;
+
+                const TensorInfo& w = st[name];
+                const TensorInfo& s = st[name + ".scale"];
+
+                t.data.assign(
+                    reinterpret_cast<const int8_t*>(w.ptr),
+                    reinterpret_cast<const int8_t*>(w.ptr) + w.numel());
+
+                auto scales = SafeTensors::to_f32(s);
+                t.scales = std::move(scales);
+                return t;
+        };
+
+        // Load a linear weight either from pre-quantized safetensors or by
+        // quantizing FP32/BF16 on the fly.
+        auto load_linear = [&](const std::string& name,
+            int rows, int cols) -> Int8Tensor {
+                if (st.has(name + ".scale")) {
+                    return load_int8(name, rows, cols);
+                }
+                auto fp32 = SafeTensors::to_f32(st[name]);
+                return quantize_per_channel(fp32, rows, cols);
+        };
+
+        // Detect which path we're on.
+        const bool prequant = st.has("model.layers.0.self_attn.q_proj.weight.scale");
+        std::fprintf(stderr, "[model] linear weights: %s\n",
+            prequant ? "pre-quantized INT8 (fast load)"
+            : "FP32/BF16 (quantizing on the fly)");
+
         embed = load("model.embed_tokens.weight");
         finalNorm = load("model.norm.weight");
 
@@ -94,19 +130,24 @@ public:
         for (int i = 0; i < NL; ++i) {
             const std::string p = "model.layers." + std::to_string(i) + ".";
             Layer& L = layers[i];
+
             L.inputNorm = load(p + "input_layernorm.weight");
-            L.q_w = load(p + "self_attn.q_proj.weight");
-            L.k_w = load(p + "self_attn.k_proj.weight");
-            L.v_w = load(p + "self_attn.v_proj.weight");
-            L.o_w = load(p + "self_attn.o_proj.weight");
+            L.postNorm = load(p + "post_attention_layernorm.weight");
+
+            L.q_w = load_linear(p + "self_attn.q_proj.weight", H, H);
+            L.k_w = load_linear(p + "self_attn.k_proj.weight", KVD, H);
+            L.v_w = load_linear(p + "self_attn.v_proj.weight", KVD, H);
+            L.o_w = load_linear(p + "self_attn.o_proj.weight", H, H);
+
+            L.gate_w = load_linear(p + "mlp.gate_proj.weight", INTER, H);
+            L.up_w = load_linear(p + "mlp.up_proj.weight", INTER, H);
+            L.down_w = load_linear(p + "mlp.down_proj.weight", H, INTER);
+
             L.q_b = load(p + "self_attn.q_proj.bias");
             L.k_b = load(p + "self_attn.k_proj.bias");
             L.v_b = load(p + "self_attn.v_proj.bias");
-            L.postNorm = load(p + "post_attention_layernorm.weight");
-            L.gate_w = load(p + "mlp.gate_proj.weight");
-            L.up_w = load(p + "mlp.up_proj.weight");
-            L.down_w = load(p + "mlp.down_proj.weight");
         }
+        std::fprintf(stderr, "[model] weights loaded\n");
 
         // Single-token buffers.
         x.assign(H, 0);          xNorm.assign(H, 0);
@@ -146,8 +187,7 @@ public:
 
     int kv_len() const { return static_cast<int>(kv_k[0].size()); }
 
-    // ??? Single-token forward pass (for generation) ????????????????????
-    // Returns a pointer to the logits buffer.
+    // ??? Single-token forward ?????????????????????????????????
     const float* forward(int token_id, int position) {
         const float* emb = embed.data() + static_cast<size_t>(token_id) * H;
         std::memcpy(x.data(), emb, H * sizeof(float));
@@ -155,15 +195,12 @@ public:
         for (int li = 0; li < NL; ++li) {
             Layer& L = layers[li];
 
-            // Pre-attention norm.
             rms_norm(x.data(), L.inputNorm.data(), H, RMS_EPS, xNorm.data());
 
-            // QKV projections.
-            matvec_parallel(xNorm.data(), H, L.q_w.data(), L.q_b.data(), q.data(), H);
-            matvec_parallel(xNorm.data(), H, L.k_w.data(), L.k_b.data(), k.data(), KVD);
-            matvec_parallel(xNorm.data(), H, L.v_w.data(), L.v_b.data(), v.data(), KVD);
+            matvec_int8_parallel(xNorm.data(), H, L.q_w, L.q_b.data(), q.data(), H);
+            matvec_int8_parallel(xNorm.data(), H, L.k_w, L.k_b.data(), k.data(), KVD);
+            matvec_int8_parallel(xNorm.data(), H, L.v_w, L.v_b.data(), v.data(), KVD);
 
-            // Rotary embeddings.
             for (int h = 0; h < NH; ++h)
                 apply_rope(q.data(), h * HD, HD, position, ROPE_THETA);
             for (int h = 0; h < NKV; ++h)
@@ -173,7 +210,6 @@ public:
             kv_v[li].emplace_back(v);
             const int seq_len = static_cast<int>(kv_k[li].size());
 
-            // Attention with GQA.
             const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
             for (int h = 0; h < NH; ++h) {
                 const int kv_head = h / GROUPS;
@@ -196,41 +232,35 @@ public:
                 }
             }
 
-            // Output projection + residual.
-            matvec_parallel(attnOut.data(), H, L.o_w.data(), nullptr,
+            matvec_int8_parallel(attnOut.data(), H, L.o_w, nullptr,
                 oProj.data(), H);
             for (int i = 0; i < H; ++i) x[i] += oProj[i];
 
-            // Post-attention norm.
             rms_norm(x.data(), L.postNorm.data(), H, RMS_EPS, xNorm.data());
 
-            // SwiGLU MLP.
-            matvec_parallel(xNorm.data(), H, L.gate_w.data(), nullptr,
+            matvec_int8_parallel(xNorm.data(), H, L.gate_w, nullptr,
                 gate.data(), INTER);
-            matvec_parallel(xNorm.data(), H, L.up_w.data(), nullptr,
+            matvec_int8_parallel(xNorm.data(), H, L.up_w, nullptr,
                 up.data(), INTER);
             silu_inplace(gate.data(), INTER);
             for (int i = 0; i < INTER; ++i) gate[i] *= up[i];
-            matvec_parallel(gate.data(), INTER, L.down_w.data(), nullptr,
+            matvec_int8_parallel(gate.data(), INTER, L.down_w, nullptr,
                 mlp.data(), H);
 
             for (int i = 0; i < H; ++i) x[i] += mlp[i];
         }
 
-        // Final norm + LM head.
         rms_norm(x.data(), finalNorm.data(), H, RMS_EPS, xNorm.data());
         matvec_parallel(xNorm.data(), H, embed.data(), nullptr,
             logits.data(), VOCAB);
         return logits.data();
     }
 
-    // ??? Batched forward pass (for prefill) ????????????????????????????
-    // Returns logits for the last token only.
+    // ??? Batched forward (prefill) ????????????????????????????
     const float* forward_batch(const std::vector<int>& tokens) {
         const int N = static_cast<int>(tokens.size());
         if (N == 0) return logits.data();
 
-        // Truncate overly long prompts to the last kMaxPrefill tokens.
         if (N > kMaxPrefill) {
             std::vector<int> tail(tokens.end() - kMaxPrefill, tokens.end());
             return forward_batch(tail);
@@ -238,10 +268,8 @@ public:
 
         const int past_len = kv_len();
 
-        // Embedding lookup.
         for (int t = 0; t < N; ++t) {
-            const float* emb =
-                embed.data() + static_cast<size_t>(tokens[t]) * H;
+            const float* emb = embed.data() + static_cast<size_t>(tokens[t]) * H;
             std::memcpy(Xb.data() + static_cast<size_t>(t) * H,
                 emb, H * sizeof(float));
         }
@@ -249,19 +277,16 @@ public:
         for (int li = 0; li < NL; ++li) {
             Layer& L = layers[li];
 
-            // Pre-attention norm.
             rms_norm_batch(Xb.data(), N, H, L.inputNorm.data(),
                 RMS_EPS, Xnb.data());
 
-            // QKV projections.
-            matvec_batch(Xnb.data(), N, H, L.q_w.data(), L.q_b.data(),
+            matvec_int8_batch(Xnb.data(), N, H, L.q_w, L.q_b.data(),
                 Qb.data(), H);
-            matvec_batch(Xnb.data(), N, H, L.k_w.data(), L.k_b.data(),
+            matvec_int8_batch(Xnb.data(), N, H, L.k_w, L.k_b.data(),
                 Kb.data(), KVD);
-            matvec_batch(Xnb.data(), N, H, L.v_w.data(), L.v_b.data(),
+            matvec_int8_batch(Xnb.data(), N, H, L.v_w, L.v_b.data(),
                 Vb.data(), KVD);
 
-            // Rotary embeddings.
             for (int t = 0; t < N; ++t) {
                 const int pos = past_len + t;
                 for (int h = 0; h < NH; ++h)
@@ -270,7 +295,6 @@ public:
                     apply_rope(Kb.data(), t * KVD + h * HD, HD, pos, ROPE_THETA);
             }
 
-            // Append to the KV cache.
             for (int t = 0; t < N; ++t) {
                 kv_k[li].emplace_back(
                     Kb.data() + static_cast<size_t>(t) * KVD,
@@ -280,7 +304,6 @@ public:
                     Vb.data() + static_cast<size_t>(t + 1) * KVD);
             }
 
-            // Causal attention.
             const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
             float* sc = scores_buf.data();
 
@@ -294,7 +317,6 @@ public:
                         Qb.data() + static_cast<size_t>(t1) * H + q_off;
                     const int cnt = past_len + t1 + 1;
 
-                    // Dot products with all attended keys.
                     for (int t2 = 0; t2 < cnt; ++t2) {
                         const float* krow = kv_k[li][t2].data() + kv_off;
                         __m128 sum = _mm_setzero_ps();
@@ -310,7 +332,6 @@ public:
                     }
                     softmax_inplace(sc, cnt);
 
-                    // Weighted sum over values.
                     float* orow =
                         AttnOutb.data() + static_cast<size_t>(t1) * H + q_off;
                     for (int d = 0; d < HD; ++d) orow[d] = 0.0f;
@@ -322,33 +343,28 @@ public:
                 }
             }
 
-            // Output projection + residual.
-            matvec_batch(AttnOutb.data(), N, H, L.o_w.data(), nullptr,
+            matvec_int8_batch(AttnOutb.data(), N, H, L.o_w, nullptr,
                 OProjb.data(), H);
             for (int i = 0; i < N * H; ++i) Xb[i] += OProjb[i];
 
-            // Post-attention norm.
             rms_norm_batch(Xb.data(), N, H, L.postNorm.data(),
                 RMS_EPS, Xnb.data());
 
-            // SwiGLU MLP.
-            matvec_batch(Xnb.data(), N, H, L.gate_w.data(), nullptr,
+            matvec_int8_batch(Xnb.data(), N, H, L.gate_w, nullptr,
                 Gateb.data(), INTER);
-            matvec_batch(Xnb.data(), N, H, L.up_w.data(), nullptr,
+            matvec_int8_batch(Xnb.data(), N, H, L.up_w, nullptr,
                 Upb.data(), INTER);
             silu_inplace(Gateb.data(), N * INTER);
             for (int i = 0; i < N * INTER; ++i) Gateb[i] *= Upb[i];
-            matvec_batch(Gateb.data(), N, INTER, L.down_w.data(), nullptr,
+            matvec_int8_batch(Gateb.data(), N, INTER, L.down_w, nullptr,
                 Mlb.data(), H);
 
             for (int i = 0; i < N * H; ++i) Xb[i] += Mlb[i];
         }
 
-        // Final norm + LM head on the last token only.
         rms_norm_batch(Xb.data(), N, H, finalNorm.data(), RMS_EPS, Xnb.data());
 
-        const float* last_xn =
-            Xnb.data() + static_cast<size_t>(N - 1) * H;
+        const float* last_xn = Xnb.data() + static_cast<size_t>(N - 1) * H;
         matvec_parallel(last_xn, H, embed.data(), nullptr,
             logits.data(), VOCAB);
 
