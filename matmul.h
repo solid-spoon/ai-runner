@@ -192,8 +192,38 @@ inline void matvec_batch(const float* __restrict X, int N, int in_dim,
 
 // RMSNorm with per-channel gamma:
 //   out[i] = gamma[i] * x[i] / sqrt(mean(x^2) + eps)
-inline void rms_norm(const float* __restrict x, const float* __restrict gamma,
+inline void rms_norm(const float* __restrict x,
+    const float* __restrict gamma,
     int n, float eps, float* __restrict out) {
+#if defined(__AVX__)
+    __m256 sum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(xv, xv));
+    }
+    // Horizontal sum of __m256.
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float ss = _mm_cvtss_f32(s);
+    for (; i < n; ++i) ss += x[i] * x[i];
+
+    const float inv = 1.0f / std::sqrt(ss / n + eps);
+    const __m256 vinv = _mm256_set1_ps(inv);
+
+    i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        const __m256 gv = _mm256_loadu_ps(gamma + i);
+        _mm256_storeu_ps(out + i,
+            _mm256_mul_ps(_mm256_mul_ps(xv, vinv), gv));
+    }
+    for (; i < n; ++i) out[i] = x[i] * inv * gamma[i];
+#else
+    // SSE2 fallback (unchanged).
     __m128 sum = _mm_setzero_ps();
     int i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -213,6 +243,7 @@ inline void rms_norm(const float* __restrict x, const float* __restrict gamma,
         _mm_storeu_ps(out + i, _mm_mul_ps(_mm_mul_ps(xv, vinv), gv));
     }
     for (; i < n; ++i) out[i] = x[i] * inv * gamma[i];
+#endif
 }
 
 // In-place SiLU activation: x = x / (1 + exp(-x)).

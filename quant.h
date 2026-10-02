@@ -60,26 +60,58 @@ inline Int8Tensor quantize_per_channel(const std::vector<float>& fp32,
     return t;
 }
 
-// Vectorized int8 dot product using SSE2 (packs 16 int8 per iteration).
-// Both `a` and `b` are treated as signed int8.
+// Vectorized int8 dot product.
+// SSE2: 16 int8/iter.  AVX1: 32 int8/iter.
 inline int32_t dot_int8_scalar(const int8_t* __restrict a,
     const int8_t* __restrict b, int n) {
+#if defined(__AVX__)
+    __m256i acc = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m256i va = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(a + i));
+        __m256i vb = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(b + i));
+
+        __m256i va_lo = _mm256_srai_epi16(
+            _mm256_unpacklo_epi8(_mm256_setzero_si256(), va), 8);
+        __m256i vb_lo = _mm256_srai_epi16(
+            _mm256_unpacklo_epi8(_mm256_setzero_si256(), vb), 8);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va_lo, vb_lo));
+
+        __m256i va_hi = _mm256_srai_epi16(
+            _mm256_unpackhi_epi8(_mm256_setzero_si256(), va), 8);
+        __m256i vb_hi = _mm256_srai_epi16(
+            _mm256_unpackhi_epi8(_mm256_setzero_si256(), vb), 8);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va_hi, vb_hi));
+    }
+
+    __m128i lo = _mm256_castsi256_si128(acc);
+    __m128i hi = _mm256_extracti128_si256(acc, 1);
+    __m128i s4 = _mm_add_epi32(lo, hi);
+    alignas(16) int32_t buf[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(buf), s4);
+    int32_t total = buf[0] + buf[1] + buf[2] + buf[3];
+
+    for (; i < n; ++i)
+        total += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
+    return total;
+#else
+    // SSE2 fallback (unchanged).
     __m128i acc = _mm_setzero_si128();
     int i = 0;
-
-    // Process 16 int8 per iteration.
     for (; i + 16 <= n; i += 16) {
-        __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
-        __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+        __m128i va = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(a + i));
+        __m128i vb = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(b + i));
 
-        // Sign-extend low 8 bytes to 8 int16, then pmaddwd.
         __m128i va_lo = _mm_srai_epi16(
             _mm_unpacklo_epi8(_mm_setzero_si128(), va), 8);
         __m128i vb_lo = _mm_srai_epi16(
             _mm_unpacklo_epi8(_mm_setzero_si128(), vb), 8);
         acc = _mm_add_epi32(acc, _mm_madd_epi16(va_lo, vb_lo));
 
-        // Same for high 8 bytes.
         __m128i va_hi = _mm_srai_epi16(
             _mm_unpackhi_epi8(_mm_setzero_si128(), va), 8);
         __m128i vb_hi = _mm_srai_epi16(
@@ -87,16 +119,14 @@ inline int32_t dot_int8_scalar(const int8_t* __restrict a,
         acc = _mm_add_epi32(acc, _mm_madd_epi16(va_hi, vb_hi));
     }
 
-    // Horizontal sum of the 4 int32 lanes.
     alignas(16) int32_t buf[4];
     _mm_store_si128(reinterpret_cast<__m128i*>(buf), acc);
     int32_t total = buf[0] + buf[1] + buf[2] + buf[3];
 
-    // Tail (< 16 elements).
-    for (; i < n; ++i) {
+    for (; i < n; ++i)
         total += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
-    }
     return total;
+#endif
 }
 
 // ??? Single int8 matvec ??????????????????????????????????????

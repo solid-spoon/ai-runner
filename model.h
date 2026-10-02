@@ -1,7 +1,4 @@
-// cpp/model.h Ч Qwen2 forward pass.
-// Linear weights + embedding can be either:
-//   (a) pre-quantized INT8 (loaded from *.scale-keyed safetensors) Ч fast path
-//   (b) FP32/BF16 (original model) Ч quantized on the fly at load time
+// cpp/model.h Ч Qwen2 forward pass with flat KV cache.
 #pragma once
 
 #include "st.h"
@@ -27,6 +24,9 @@ struct Qwen2Config {
 };
 
 inline constexpr int kMaxPrefill = 1024;
+// Bump this if you need longer context. Memory cost is
+//   2 * NL * kMaxContext * KVD * 4 bytes
+//   = 2 * 24 * 8192 * 128 * 4 = ~201 MB for kMaxContext=8192.
 inline constexpr int kMaxContext = 8192;
 
 class Qwen2Model {
@@ -36,7 +36,6 @@ public:
     int H, NH, NKV, NL, HD, KVD, INTER, VOCAB, GROUPS;
     float RMS_EPS, ROPE_THETA;
 
-    // Embedding (INT8, per-token scale). Tied with the LM head.
     Int8Tensor embed;
     std::vector<float> finalNorm;
 
@@ -51,8 +50,13 @@ public:
     };
     std::vector<Layer> layers;
 
-    std::vector<std::vector<std::vector<float>>> kv_k;
-    std::vector<std::vector<std::vector<float>>> kv_v;
+    // Flat KV cache.
+    //   Layout: kv_k_flat[li * (kMaxContext * KVD) + t * KVD + c]
+    //   li = layer in [0, NL), t = position, c = channel in [0, KVD).
+    //   All layers share a single kv_len_ Ч they always have the same length.
+    std::vector<float> kv_k_flat;
+    std::vector<float> kv_v_flat;
+    int kv_len_ = 0;
 
     // Single-token scratch.
     std::vector<float> x, xNorm;
@@ -79,17 +83,19 @@ public:
         RMS_EPS = cfg.rms_norm_eps;
         ROPE_THETA = cfg.rope_theta;
         GROUPS = NH / NKV;
-        init_rope_cache(HD, ROPE_THETA);
 
         std::fprintf(stderr,
             "[model] H=%d NH=%d NKV=%d NL=%d HD=%d KVD=%d INTER=%d VOCAB=%d\n",
             H, NH, NKV, NL, HD, KVD, INTER, VOCAB);
+        std::fprintf(stderr,
+            "[model] flat KV cache: %d layers x %d positions x %d ch = %.1f MB\n",
+            NL, kMaxContext, KVD,
+            (2.0 * NL * kMaxContext * KVD * 4) / 1e6);
 
         auto load = [&](const std::string& name) {
             return SafeTensors::to_f32(st[name]);
         };
 
-        // Pre-quantized int8 tensor with a companion `.scale` tensor.
         auto load_int8 = [&](const std::string& name,
             int rows, int cols) -> Int8Tensor {
                 Int8Tensor t;
@@ -107,7 +113,6 @@ public:
                 return t;
         };
 
-        // Load either pre-quantized INT8 or quantize FP32/BF16 on the fly.
         auto load_linear = [&](const std::string& name,
             int rows, int cols) -> Int8Tensor {
                 if (st.has(name + ".scale")) {
@@ -123,7 +128,9 @@ public:
             prequant ? "pre-quantized INT8 (fast load)"
             : "FP32/BF16 (quantizing on the fly)");
 
-        // Embedding: INT8 with per-token scale (tied with LM head).
+        // RoPE cos/sin cache.
+        init_rope_cache(HD, ROPE_THETA);
+
         embed = load_linear("model.embed_tokens.weight", VOCAB, H);
         finalNorm = load("model.norm.weight");
 
@@ -150,6 +157,13 @@ public:
         }
         std::fprintf(stderr, "[model] weights loaded\n");
 
+        // Flat KV cache Ч one allocation per matrix.
+        const size_t kv_size =
+            static_cast<size_t>(NL) * kMaxContext * KVD;
+        kv_k_flat.assign(kv_size, 0.0f);
+        kv_v_flat.assign(kv_size, 0.0f);
+        kv_len_ = 0;
+
         // Single-token buffers.
         x.assign(H, 0);          xNorm.assign(H, 0);
         q.assign(H, 0);          k.assign(KVD, 0);    v.assign(KVD, 0);
@@ -170,25 +184,31 @@ public:
         Upb.assign(static_cast<size_t>(kMaxPrefill) * INTER, 0);
         Mlb.assign(static_cast<size_t>(kMaxPrefill) * H, 0);
         scores_buf.assign(kMaxContext, 0);
-
-        kv_k.resize(NL);
-        kv_v.resize(NL);
-        for (int i = 0; i < NL; ++i) {
-            kv_k[i].reserve(kMaxContext);
-            kv_v[i].reserve(kMaxContext);
-        }
     }
 
-    void reset_kv() {
-        for (int i = 0; i < NL; ++i) {
-            kv_k[i].clear();
-            kv_v[i].clear();
-        }
+    // O(1) Ч никакого обхода 24 слоЄв.
+    void reset_kv() { kv_len_ = 0; }
+
+    int kv_len() const { return kv_len_; }
+
+    // Pointer to the start of (layer li, position t) inside the flat K cache.
+    inline float* k_at(int li, int t) {
+        return kv_k_flat.data()
+            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
+    }
+    inline const float* k_at(int li, int t) const {
+        return kv_k_flat.data()
+            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
+    }
+    inline float* v_at(int li, int t) {
+        return kv_v_flat.data()
+            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
+    }
+    inline const float* v_at(int li, int t) const {
+        return kv_v_flat.data()
+            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
     }
 
-    int kv_len() const { return static_cast<int>(kv_k[0].size()); }
-
-    // Dequantize one embedding row into `out` (H floats).
     inline void embed_lookup(int token_id, float* __restrict out) const {
         const int8_t* row = embed.data.data()
             + static_cast<size_t>(token_id) * H;
@@ -198,6 +218,15 @@ public:
 
     // ??? Single-token forward ?????????????????????????????????
     const float* forward(int token_id, int position) {
+        // Guard against overflow.
+        if (kv_len_ >= kMaxContext) {
+            std::fprintf(stderr, "[warn] context full, resetting KV cache\n");
+            reset_kv();
+            position = 0;
+        }
+
+        const int pos = kv_len_;   // position we're writing this token at
+
         embed_lookup(token_id, x.data());
 
         for (int li = 0; li < NL; ++li) {
@@ -210,22 +239,29 @@ public:
             matvec_int8_parallel(xNorm.data(), H, L.v_w, L.v_b.data(), v.data(), KVD);
 
             for (int h = 0; h < NH; ++h)
-                apply_rope(q.data(), h * HD, HD, position, ROPE_THETA);
+                apply_rope(q.data(), h * HD, HD, pos, ROPE_THETA);
             for (int h = 0; h < NKV; ++h)
-                apply_rope(k.data(), h * HD, HD, position, ROPE_THETA);
+                apply_rope(k.data(), h * HD, HD, pos, ROPE_THETA);
 
-            kv_k[li].emplace_back(k);
-            kv_v[li].emplace_back(v);
-            const int seq_len = static_cast<int>(kv_k[li].size());
+            // Write this position into the flat cache.
+            std::memcpy(k_at(li, pos), k.data(), KVD * sizeof(float));
+            std::memcpy(v_at(li, pos), v.data(), KVD * sizeof(float));
+
+            const int seq_len = pos + 1;
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+            const float* kbase = kv_k_flat.data()
+                + static_cast<size_t>(li) * kMaxContext * KVD;
+            const float* vbase = kv_v_flat.data()
+                + static_cast<size_t>(li) * kMaxContext * KVD;
+
             for (int h = 0; h < NH; ++h) {
                 const int kv_head = h / GROUPS;
                 const int q_off = h * HD;
                 const int kv_off = kv_head * HD;
 
                 for (int t = 0; t < seq_len; ++t) {
-                    const float* kt = kv_k[li][t].data() + kv_off;
+                    const float* kt = kbase + static_cast<size_t>(t) * KVD + kv_off;
                     float s = 0.0f;
                     for (int d = 0; d < HD; ++d) s += q[q_off + d] * kt[d];
                     scores[t] = s * scale;
@@ -235,7 +271,7 @@ public:
                 for (int d = 0; d < HD; ++d) {
                     float s = 0.0f;
                     for (int t = 0; t < seq_len; ++t)
-                        s += scores[t] * kv_v[li][t][kv_off + d];
+                        s += scores[t] * vbase[static_cast<size_t>(t) * KVD + kv_off + d];
                     attnOut[q_off + d] = s;
                 }
             }
@@ -259,16 +295,16 @@ public:
         }
 
         rms_norm(x.data(), finalNorm.data(), H, RMS_EPS, xNorm.data());
-
-        // LM head: INT8 matvec over the tied embedding matrix.
         matvec_int8_parallel(xNorm.data(), H, embed, nullptr,
             logits.data(), VOCAB);
+
+        kv_len_++;
         return logits.data();
     }
 
     // ??? Batched forward (prefill) ????????????????????????????
     const float* forward_batch(const std::vector<int>& tokens) {
-        const int N = static_cast<int>(tokens.size());
+        int N = static_cast<int>(tokens.size());
         if (N == 0) return logits.data();
 
         if (N > kMaxPrefill) {
@@ -276,9 +312,21 @@ public:
             return forward_batch(tail);
         }
 
-        const int past_len = kv_len();
+        // Guard against context overflow.
+        if (kv_len_ + N > kMaxContext) {
+            std::fprintf(stderr,
+                "[warn] context would overflow (%d + %d > %d), resetting\n",
+                kv_len_, N, kMaxContext);
+            reset_kv();
+            if (N > kMaxContext) {
+                std::vector<int> tail(tokens.end() - kMaxContext, tokens.end());
+                return forward_batch(tail);
+            }
+        }
 
-        // Embedding lookup (INT8 ? FP32).
+        const int past_len = kv_len_;
+
+        // Embedding lookup.
         for (int t = 0; t < N; ++t) {
             embed_lookup(tokens[t], Xb.data() + static_cast<size_t>(t) * H);
         }
@@ -304,17 +352,22 @@ public:
                     apply_rope(Kb.data(), t * KVD + h * HD, HD, pos, ROPE_THETA);
             }
 
+            // Write N new positions into the flat cache.
             for (int t = 0; t < N; ++t) {
-                kv_k[li].emplace_back(
+                std::memcpy(k_at(li, past_len + t),
                     Kb.data() + static_cast<size_t>(t) * KVD,
-                    Kb.data() + static_cast<size_t>(t + 1) * KVD);
-                kv_v[li].emplace_back(
+                    KVD * sizeof(float));
+                std::memcpy(v_at(li, past_len + t),
                     Vb.data() + static_cast<size_t>(t) * KVD,
-                    Vb.data() + static_cast<size_t>(t + 1) * KVD);
+                    KVD * sizeof(float));
             }
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
             float* sc = scores_buf.data();
+            const float* kbase = kv_k_flat.data()
+                + static_cast<size_t>(li) * kMaxContext * KVD;
+            const float* vbase = kv_v_flat.data()
+                + static_cast<size_t>(li) * kMaxContext * KVD;
 
             for (int h = 0; h < NH; ++h) {
                 const int kv_head = h / GROUPS;
@@ -327,7 +380,7 @@ public:
                     const int cnt = past_len + t1 + 1;
 
                     for (int t2 = 0; t2 < cnt; ++t2) {
-                        const float* krow = kv_k[li][t2].data() + kv_off;
+                        const float* krow = kbase + static_cast<size_t>(t2) * KVD + kv_off;
                         __m128 sum = _mm_setzero_ps();
                         int d = 0;
                         for (; d + 4 <= HD; d += 4) {
@@ -346,7 +399,7 @@ public:
                     for (int d = 0; d < HD; ++d) orow[d] = 0.0f;
                     for (int t2 = 0; t2 < cnt; ++t2) {
                         const float w = sc[t2];
-                        const float* vrow = kv_v[li][t2].data() + kv_off;
+                        const float* vrow = vbase + static_cast<size_t>(t2) * KVD + kv_off;
                         for (int d = 0; d < HD; ++d) orow[d] += w * vrow[d];
                     }
                 }
@@ -373,11 +426,11 @@ public:
 
         rms_norm_batch(Xb.data(), N, H, finalNorm.data(), RMS_EPS, Xnb.data());
 
-        // LM head: only the last token's logits matter.
         const float* last_xn = Xnb.data() + static_cast<size_t>(N - 1) * H;
         matvec_int8_parallel(last_xn, H, embed, nullptr,
             logits.data(), VOCAB);
 
+        kv_len_ += N;
         return logits.data();
     }
 };
