@@ -1,3 +1,4 @@
+```bash
 [load] safetensors: 1.1 ms (290 tensors)
 [tokenizer] vocab: 151646, merges: 151387
 [load] tokenizer: 203.2 ms (vocab=151646)
@@ -13,3 +14,4 @@ you > hello! how are you?
 ai  > [prefill] 38 tokens... done in 5367 ms
 Hello! I'm doing well, thank you for asking. How can I assist you today?
 [gen] 19 tokens in 2746 ms (6.9 tok/s)
+```
