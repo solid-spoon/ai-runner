@@ -1,4 +1,4 @@
-// cpp/ui.h — Minimal terminal UI helpers (Windows + POSIX).
+// cpp/ui.h â€” Minimal terminal UI helpers (Windows + POSIX).
 //
 // All on-screen decorations are plain ASCII so the UI renders identically
 // on any terminal, code page, and font. No box-drawing, no braille,
@@ -149,7 +149,7 @@ namespace ui {
     // Reads one line of user input as UTF-8.
     //
     // On Windows, `std::getline(std::cin, ...)` returns bytes in the console's
-    // *code page*, not UTF-8 — so CJK and other non-ASCII characters get
+    // *code page*, not UTF-8 â€” so CJK and other non-ASCII characters get
     // destroyed. We avoid this by going through the wide-character API
     // `ReadConsoleW`, which always speaks UTF-16. We then convert to UTF-8.
     //
@@ -289,7 +289,7 @@ namespace ui {
         const int total = term_width();
         const int inner = std::min(total - 6, 76);
 
-        std::printf("\n  %s-- commands ", color::gray2(), color::reset());
+        std::printf("\n  %s-- commands %s", color::gray2(), color::reset());
         for (int i = 0; i < std::max(0, inner - 15); ++i) std::printf("-");
         std::printf("%s\n", color::reset());
 
