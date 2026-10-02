@@ -1,5 +1,5 @@
 // cpp/model.h — Qwen2 forward pass.
-// Linear weights can be either:
+// Linear weights + embedding can be either:
 //   (a) pre-quantized INT8 (loaded from *.scale-keyed safetensors) — fast path
 //   (b) FP32/BF16 (original model) — quantized on the fly at load time
 #pragma once
@@ -36,7 +36,8 @@ public:
     int H, NH, NKV, NL, HD, KVD, INTER, VOCAB, GROUPS;
     float RMS_EPS, ROPE_THETA;
 
-    std::vector<float> embed;
+    // Embedding (INT8, per-token scale). Tied with the LM head.
+    Int8Tensor embed;
     std::vector<float> finalNorm;
 
     struct Layer {
@@ -101,13 +102,11 @@ public:
                     reinterpret_cast<const int8_t*>(w.ptr),
                     reinterpret_cast<const int8_t*>(w.ptr) + w.numel());
 
-                auto scales = SafeTensors::to_f32(s);
-                t.scales = std::move(scales);
+                t.scales = SafeTensors::to_f32(s);
                 return t;
         };
 
-        // Load a linear weight either from pre-quantized safetensors or by
-        // quantizing FP32/BF16 on the fly.
+        // Load either pre-quantized INT8 or quantize FP32/BF16 on the fly.
         auto load_linear = [&](const std::string& name,
             int rows, int cols) -> Int8Tensor {
                 if (st.has(name + ".scale")) {
@@ -117,13 +116,14 @@ public:
                 return quantize_per_channel(fp32, rows, cols);
         };
 
-        // Detect which path we're on.
-        const bool prequant = st.has("model.layers.0.self_attn.q_proj.weight.scale");
+        const bool prequant =
+            st.has("model.layers.0.self_attn.q_proj.weight.scale");
         std::fprintf(stderr, "[model] linear weights: %s\n",
             prequant ? "pre-quantized INT8 (fast load)"
             : "FP32/BF16 (quantizing on the fly)");
 
-        embed = load("model.embed_tokens.weight");
+        // Embedding: INT8 with per-token scale (tied with LM head).
+        embed = load_linear("model.embed_tokens.weight", VOCAB, H);
         finalNorm = load("model.norm.weight");
 
         layers.resize(NL);
@@ -187,10 +187,17 @@ public:
 
     int kv_len() const { return static_cast<int>(kv_k[0].size()); }
 
+    // Dequantize one embedding row into `out` (H floats).
+    inline void embed_lookup(int token_id, float* __restrict out) const {
+        const int8_t* row = embed.data.data()
+            + static_cast<size_t>(token_id) * H;
+        const float sc = embed.scales[token_id];
+        for (int i = 0; i < H; ++i) out[i] = static_cast<float>(row[i]) * sc;
+    }
+
     // ??? Single-token forward ?????????????????????????????????
     const float* forward(int token_id, int position) {
-        const float* emb = embed.data() + static_cast<size_t>(token_id) * H;
-        std::memcpy(x.data(), emb, H * sizeof(float));
+        embed_lookup(token_id, x.data());
 
         for (int li = 0; li < NL; ++li) {
             Layer& L = layers[li];
@@ -251,7 +258,9 @@ public:
         }
 
         rms_norm(x.data(), finalNorm.data(), H, RMS_EPS, xNorm.data());
-        matvec_parallel(xNorm.data(), H, embed.data(), nullptr,
+
+        // LM head: INT8 matvec over the tied embedding matrix.
+        matvec_int8_parallel(xNorm.data(), H, embed, nullptr,
             logits.data(), VOCAB);
         return logits.data();
     }
@@ -268,10 +277,9 @@ public:
 
         const int past_len = kv_len();
 
+        // Embedding lookup (INT8 ? FP32).
         for (int t = 0; t < N; ++t) {
-            const float* emb = embed.data() + static_cast<size_t>(tokens[t]) * H;
-            std::memcpy(Xb.data() + static_cast<size_t>(t) * H,
-                emb, H * sizeof(float));
+            embed_lookup(tokens[t], Xb.data() + static_cast<size_t>(t) * H);
         }
 
         for (int li = 0; li < NL; ++li) {
@@ -364,8 +372,9 @@ public:
 
         rms_norm_batch(Xb.data(), N, H, finalNorm.data(), RMS_EPS, Xnb.data());
 
+        // LM head: only the last token's logits matter.
         const float* last_xn = Xnb.data() + static_cast<size_t>(N - 1) * H;
-        matvec_parallel(last_xn, H, embed.data(), nullptr,
+        matvec_int8_parallel(last_xn, H, embed, nullptr,
             logits.data(), VOCAB);
 
         return logits.data();

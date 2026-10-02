@@ -78,11 +78,16 @@ namespace {
 
         SafeTensorsWriter w;
 
-        // Global tensors (FP32).
+        // Embedding + LM head (tied): INT8, per-token scale.
         {
             auto t = SafeTensors::to_f32(st["model.embed_tokens.weight"]);
-            w.add_f32("model.embed_tokens.weight", { VOCAB, H }, t.data(), t.size());
+            auto q = quantize_matrix(t, VOCAB, H);
+            w.add_i8("model.embed_tokens.weight",
+                { VOCAB, H }, q.q.data(), q.q.size());
+            w.add_f32("model.embed_tokens.weight.scale",
+                { VOCAB }, q.scales.data(), q.scales.size());
         }
+        // Final norm: FP32 (tiny).
         {
             auto t = SafeTensors::to_f32(st["model.norm.weight"]);
             w.add_f32("model.norm.weight", { H }, t.data(), t.size());
