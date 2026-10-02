@@ -15,3 +15,4 @@ ai  > [prefill] 38 tokens... done in 5367 ms
 Hello! I'm doing well, thank you for asking. How can I assist you today?
 [gen] 19 tokens in 2746 ms (6.9 tok/s)
 ```
+Runs on Pentium G5420 without AVX2.
