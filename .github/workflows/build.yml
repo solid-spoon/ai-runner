@@ -13,9 +13,6 @@ jobs:
           - os: windows-latest
             artifact: build/Release/airun.exe
             name: windows-x64
-          - os: macos-13
-            artifact: build/airun
-            name: macos-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
