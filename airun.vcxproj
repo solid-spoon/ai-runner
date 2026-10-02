@@ -137,6 +137,7 @@
     <ClInclude Include="sampler.h" />
     <ClInclude Include="st.h" />
     <ClInclude Include="tokenizer.h" />
+    <ClInclude Include="ui.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
