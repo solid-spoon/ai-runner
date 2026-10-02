@@ -79,6 +79,7 @@ public:
         RMS_EPS = cfg.rms_norm_eps;
         ROPE_THETA = cfg.rope_theta;
         GROUPS = NH / NKV;
+        init_rope_cache(HD, ROPE_THETA);
 
         std::fprintf(stderr,
             "[model] H=%d NH=%d NKV=%d NL=%d HD=%d KVD=%d INTER=%d VOCAB=%d\n",

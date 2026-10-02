@@ -17,6 +17,40 @@
 #include <emmintrin.h>   // SSE2
 #include <xmmintrin.h>   // SSE
 
+// ??? RoPE: cos/sin cache ?????????????????????????????????????
+// cos/sin depend only on (position, i). For a given position, the same
+// 32 pairs are reused by all 14 heads in all 24 layers. Cache them.
+static constexpr int kMaxRopeDim = 128;   // Qwen2: head_dim=64, half=32
+static constexpr int kMaxRopePos = 8192;
+
+struct RopeCache {
+    bool inited = false;
+    float cos_tab[kMaxRopePos][kMaxRopeDim / 2];
+    float sin_tab[kMaxRopePos][kMaxRopeDim / 2];
+};
+
+inline RopeCache& rope_cache() {
+    static RopeCache c;
+    return c;
+}
+
+inline void init_rope_cache(int head_dim, float theta_base) {
+    RopeCache& c = rope_cache();
+    if (c.inited) return;
+    const int half = head_dim / 2;
+    for (int pos = 0; pos < kMaxRopePos; ++pos) {
+        for (int i = 0; i < half; ++i) {
+            const float freq = std::pow(theta_base, -2.0f * i / head_dim);
+            const float angle = pos * freq;
+            c.cos_tab[pos][i] = std::cos(angle);
+            c.sin_tab[pos][i] = std::sin(angle);
+        }
+    }
+    c.inited = true;
+    std::fprintf(stderr, "[rope] cache initialized (%d positions ? %d dims)\n",
+        kMaxRopePos, half);
+}
+
 // Returns the number of hardware threads, or 4 as a fallback.
 inline int num_threads() {
     const unsigned n = std::thread::hardware_concurrency();
@@ -207,17 +241,16 @@ inline void softmax_inplace(float* x, int n) {
 // Applies rotary position embedding (RoPE) to a single head.
 // The head is laid out as [x0..x_{half-1}, x_{half}..x_{head_dim-1}].
 inline void apply_rope(float* vec, int offset, int head_dim,
-    int position, float theta_base) {
+    int position, float /*theta_base*/) {
     const int half = head_dim / 2;
+    const RopeCache& c = rope_cache();
+    const float* cos_row = c.cos_tab[position];
+    const float* sin_row = c.sin_tab[position];
     for (int i = 0; i < half; ++i) {
-        const float freq = std::pow(theta_base, -2.0f * i / head_dim);
-        const float angle = position * freq;
-        const float c = std::cos(angle);
-        const float s = std::sin(angle);
         const float x0 = vec[offset + i];
         const float x1 = vec[offset + i + half];
-        vec[offset + i] = x0 * c - x1 * s;
-        vec[offset + i + half] = x0 * s + x1 * c;
+        vec[offset + i] = x0 * cos_row[i] - x1 * sin_row[i];
+        vec[offset + i + half] = x0 * sin_row[i] + x1 * cos_row[i];
     }
 }
 

@@ -60,13 +60,43 @@ inline Int8Tensor quantize_per_channel(const std::vector<float>& fp32,
     return t;
 }
 
-// Scalar int8 dot: acc = sum_i a[i] * b[i], both int8.
+// Vectorized int8 dot product using SSE2 (packs 16 int8 per iteration).
+// Both `a` and `b` are treated as signed int8.
 inline int32_t dot_int8_scalar(const int8_t* __restrict a,
     const int8_t* __restrict b, int n) {
-    int32_t acc = 0;
-    for (int i = 0; i < n; ++i)
-        acc += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
-    return acc;
+    __m128i acc = _mm_setzero_si128();
+    int i = 0;
+
+    // Process 16 int8 per iteration.
+    for (; i + 16 <= n; i += 16) {
+        __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+        __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+
+        // Sign-extend low 8 bytes to 8 int16, then pmaddwd.
+        __m128i va_lo = _mm_srai_epi16(
+            _mm_unpacklo_epi8(_mm_setzero_si128(), va), 8);
+        __m128i vb_lo = _mm_srai_epi16(
+            _mm_unpacklo_epi8(_mm_setzero_si128(), vb), 8);
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(va_lo, vb_lo));
+
+        // Same for high 8 bytes.
+        __m128i va_hi = _mm_srai_epi16(
+            _mm_unpackhi_epi8(_mm_setzero_si128(), va), 8);
+        __m128i vb_hi = _mm_srai_epi16(
+            _mm_unpackhi_epi8(_mm_setzero_si128(), vb), 8);
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(va_hi, vb_hi));
+    }
+
+    // Horizontal sum of the 4 int32 lanes.
+    alignas(16) int32_t buf[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(buf), acc);
+    int32_t total = buf[0] + buf[1] + buf[2] + buf[3];
+
+    // Tail (< 16 elements).
+    for (; i < n; ++i) {
+        total += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
+    }
+    return total;
 }
 
 // ??? Single int8 matvec ??????????????????????????????????????
