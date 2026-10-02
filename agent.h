@@ -1,4 +1,4 @@
-// cpp/agent.h — Qwen2 chat agent driving the TUI, with prefix caching.
+// cpp/agent.h â€” Qwen2 chat agent driving the TUI, with prefix caching.
 #pragma once
 
 #include "model.h"
@@ -156,7 +156,7 @@ public:
         // ??? 5. TRACK WHAT'S NOW IN THE KV CACHE ???????????????????
         // KV holds: every prompt token + every generated token.
         // (The stopping token is sampled but never forwarded, so it's
-        //  not part of the cache — matching the next prompt's prefix
+        //  not part of the cache â€” matching the next prompt's prefix
         //  logic, which sees <|im_end|> as the first "new" token.)
         cached_ids_ = ids;
         cached_ids_.insert(cached_ids_.end(),
@@ -213,11 +213,11 @@ inline void run_agent(Qwen2Model& model, Qwen2Tokenizer& tok) {
             continue;
         }
         if (line == "/clear") {
-#ifdef _WIN32
-            std::system("cls");
-#else
-            std::system("clear");
-#endif
+            #ifdef _WIN32
+                (void)std::system("cls");
+            #else
+                (void)std::system("clear");
+            #endif
             ui::banner();
             continue;
         }
