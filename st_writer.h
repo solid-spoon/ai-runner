@@ -41,7 +41,6 @@ public:
     }
 
     bool save(const std::string& path) const {
-        // ??? Build JSON header ???
         std::string json = "{";
         size_t offset = 0;
         for (size_t i = 0; i < entries_.size(); ++i) {
@@ -66,9 +65,13 @@ public:
         // Pad to 8-byte alignment (spec requirement).
         while (json.size() % 8 != 0) json += ' ';
 
-        // ??? Write file ???
         FILE* f = nullptr;
+#ifdef _WIN32
         if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) return false;
+#else
+        f = std::fopen(path.c_str(), "wb");
+        if (!f) return false;
+#endif
 
         const uint64_t header_len = json.size();
         std::fwrite(&header_len, 8, 1, f);

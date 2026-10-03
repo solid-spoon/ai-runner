@@ -44,6 +44,16 @@ namespace {
         return static_cast<size_t>(f.tellg());
     }
 
+    FILE* open_write_bin(const std::string& path) {
+#ifdef _WIN32
+        FILE* f = nullptr;
+        if (fopen_s(&f, path.c_str(), "wb") != 0) return nullptr;
+        return f;
+#else
+        return std::fopen(path.c_str(), "wb");
+#endif
+    }
+
     std::vector<std::pair<std::string, int>>
         choose_specials(const ModelConfig& cfg) {
         if (cfg.is_qwen3()) {
@@ -195,8 +205,8 @@ static int airun_main(int argc, char** argv) {
         const std::string& vocab_obj = vpair.first;
         const std::string vocab_path = out_dir + "/vocab.json";
         {
-            FILE* o = nullptr;
-            if (fopen_s(&o, vocab_path.c_str(), "wb") != 0 || !o)
+            FILE* o = open_write_bin(vocab_path);
+            if (!o)
                 throw std::runtime_error("cannot write: " + vocab_path);
             std::fwrite(vocab_obj.data(), 1, vocab_obj.size(), o);
             std::fclose(o);
@@ -281,8 +291,8 @@ static int airun_main(int argc, char** argv) {
 
         const std::string merges_path = out_dir + "/merges.txt";
         {
-            FILE* o = nullptr;
-            if (fopen_s(&o, merges_path.c_str(), "wb") != 0 || !o)
+            FILE* o = open_write_bin(merges_path);
+            if (!o)
                 throw std::runtime_error("cannot write: " + merges_path);
             std::fwrite(merges_txt.data(), 1, merges_txt.size(), o);
             std::fclose(o);

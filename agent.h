@@ -8,6 +8,7 @@
 #include "config.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -254,9 +255,9 @@ inline void run_agent(QwenModel& model, Qwen2Tokenizer& tok,
         }
         if (line == "/clear") {
 #ifdef _WIN32
-            (void)std::system("cls");
+            if (std::system("cls") != 0) { /* ignore */ }
 #else
-            (void)std::system("clear");
+            if (std::system("clear") != 0) { /* ignore */ }
 #endif
             ui::banner(title);
             continue;

@@ -10,17 +10,15 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <vector>
 #include <thread>
 #include <algorithm>
 
-#include <emmintrin.h>   // SSE2
-#include <xmmintrin.h>   // SSE
+#include <immintrin.h>   // SSE, SSE2, AVX, AVX2 — all x86 intrinsics
 
-// ??? RoPE: cos/sin cache ?????????????????????????????????????
-// cos/sin depend only on (position, i). For a given position, the same
-// 32 pairs are reused by all 14 heads in all 24 layers. Cache them.
-static constexpr int kMaxRopeDim = 128;   // Qwen2: head_dim=64, half=32
+// RoPE: cos/sin cache
+static constexpr int kMaxRopeDim = 128;
 static constexpr int kMaxRopePos = 8192;
 
 struct RopeCache {
@@ -47,17 +45,15 @@ inline void init_rope_cache(int head_dim, float theta_base) {
         }
     }
     c.inited = true;
-    std::fprintf(stderr, "[rope] cache initialized (%d positions ? %d dims)\n",
+    std::fprintf(stderr, "[rope] cache initialized (%d positions x %d dims)\n",
         kMaxRopePos, half);
 }
 
-// Returns the number of hardware threads, or 4 as a fallback.
 inline int num_threads() {
     const unsigned n = std::thread::hardware_concurrency();
     return n > 0 ? static_cast<int>(n) : 4;
 }
 
-// Horizontal sum of the four floats packed into an __m128 register.
 inline float hsum_sse(__m128 v) {
     __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1));
     __m128 sums = _mm_add_ps(v, shuf);
@@ -66,7 +62,6 @@ inline float hsum_sse(__m128 v) {
     return _mm_cvtss_f32(sums);
 }
 
-// SSE2 dot product of two float vectors of length n.
 inline float dot_sse2(const float* __restrict x,
     const float* __restrict w,
     int n) {
@@ -82,7 +77,6 @@ inline float dot_sse2(const float* __restrict x,
     return s;
 }
 
-// Single-threaded matvec: y = W * x + b, with W stored row-major [out_dim, in_dim].
 inline void matvec(const float* __restrict x, int in_dim,
     const float* __restrict W,
     const float* __restrict b,
@@ -95,7 +89,6 @@ inline void matvec(const float* __restrict x, int in_dim,
     }
 }
 
-// Work description for a single matvec worker thread.
 struct MatvecTask {
     const float* x;
     const float* W;
@@ -106,7 +99,6 @@ struct MatvecTask {
     int j_end;
 };
 
-// Worker entry point: computes output rows [j_begin, j_end).
 inline void matvec_worker(MatvecTask* t) {
     for (int j = t->j_begin; j < t->j_end; ++j) {
         const float s = dot_sse2(t->x,
@@ -116,7 +108,6 @@ inline void matvec_worker(MatvecTask* t) {
     }
 }
 
-// Multithreaded matvec; falls back to the single-threaded path for small outputs.
 inline void matvec_parallel(const float* __restrict x, int in_dim,
     const float* __restrict W,
     const float* __restrict b,
@@ -143,8 +134,6 @@ inline void matvec_parallel(const float* __restrict x, int in_dim,
     for (auto& th : threads) th.join();
 }
 
-// Batched matvec for prefill: X has shape [N, in_dim], output has shape [N, out_dim].
-// Parallelism is across output rows, so each weight row is streamed exactly once.
 inline void matvec_batch(const float* __restrict X, int N, int in_dim,
     const float* __restrict W,
     const float* __restrict b,
@@ -190,11 +179,11 @@ inline void matvec_batch(const float* __restrict X, int N, int in_dim,
     }
 }
 
-// RMSNorm with per-channel gamma:
-//   out[i] = gamma[i] * x[i] / sqrt(mean(x^2) + eps)
+// RMSNorm. NOTE: `out` is intentionally NOT `__restrict` — callers may
+// pass `out == x` for in-place normalization.
 inline void rms_norm(const float* __restrict x,
     const float* __restrict gamma,
-    int n, float eps, float* __restrict out) {
+    int n, float eps, float* out) {
 #if defined(__AVX__)
     __m256 sum = _mm256_setzero_ps();
     int i = 0;
@@ -202,7 +191,6 @@ inline void rms_norm(const float* __restrict x,
         const __m256 xv = _mm256_loadu_ps(x + i);
         sum = _mm256_add_ps(sum, _mm256_mul_ps(xv, xv));
     }
-    // Horizontal sum of __m256.
     __m128 lo = _mm256_castps256_ps128(sum);
     __m128 hi = _mm256_extractf128_ps(sum, 1);
     __m128 s = _mm_add_ps(lo, hi);
@@ -223,7 +211,6 @@ inline void rms_norm(const float* __restrict x,
     }
     for (; i < n; ++i) out[i] = x[i] * inv * gamma[i];
 #else
-    // SSE2 fallback (unchanged).
     __m128 sum = _mm_setzero_ps();
     int i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -246,7 +233,6 @@ inline void rms_norm(const float* __restrict x,
 #endif
 }
 
-// In-place SiLU activation: x = x / (1 + exp(-x)).
 inline void silu_inplace(float* x, int n) {
     for (int i = 0; i < n; ++i) {
         const float v = x[i];
@@ -254,7 +240,6 @@ inline void silu_inplace(float* x, int n) {
     }
 }
 
-// In-place numerically stable softmax.
 inline void softmax_inplace(float* x, int n) {
     float mx = x[0];
     for (int i = 1; i < n; ++i) if (x[i] > mx) mx = x[i];
@@ -269,8 +254,6 @@ inline void softmax_inplace(float* x, int n) {
     for (int i = 0; i < n; ++i) x[i] *= inv;
 }
 
-// Applies rotary position embedding (RoPE) to a single head.
-// The head is laid out as [x0..x_{half-1}, x_{half}..x_{head_dim-1}].
 inline void apply_rope(float* vec, int offset, int head_dim,
     int position, float /*theta_base*/) {
     const int half = head_dim / 2;
@@ -285,7 +268,6 @@ inline void apply_rope(float* vec, int offset, int head_dim,
     }
 }
 
-// Batched RMSNorm applied row-wise to X of shape [N, H].
 inline void rms_norm_batch(const float* __restrict X, int N, int H,
     const float* __restrict gamma, float eps,
     float* __restrict out) {
