@@ -1,5 +1,9 @@
 name: build
+
 on: [push, pull_request]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -7,22 +11,58 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             artifact: build/airun
             name: linux-x64
-          - os: windows-latest
+            generator: ""
+          - os: windows-2022
             artifact: build/Release/airun.exe
             name: windows-x64
+            generator: -G "Visual Studio 17 2022" -A x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Print toolchain versions
+        shell: bash
+        run: |
+          cmake --version
+          echo "---"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cl 2>&1 | head -1 || true
+          else
+            g++ --version | head -1
+          fi
+
+      - name: Cache build dir
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ matrix.name }}-cmake-${{ hashFiles('CMakeLists.txt', '*.h', '*.cpp') }}
+          restore-keys: |
+            ${{ matrix.name }}-cmake-
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: cmake -B build ${{ matrix.generator }} -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release
+        shell: bash
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify binary exists
+        shell: bash
+        run: |
+          if [ ! -f "${{ matrix.artifact }}" ]; then
+            echo "::error::binary not found at ${{ matrix.artifact }}"
+            echo "--- dumping build dir ---"
+            find build -type f \( -name "airun*" -o -name "*.exe" \) 2>/dev/null || ls -laR build
+            exit 1
+          fi
+          ls -la "${{ matrix.artifact }}"
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -30,3 +70,4 @@ jobs:
           name: airun-${{ matrix.name }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+          retention-days: 14
