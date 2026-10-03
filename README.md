@@ -43,11 +43,16 @@
   ----------------------------------------------------------------------------
   this model supports /think — toggle reasoning mode
   you > Hi
+
   aI  > Hello! 😊
   prefill 38 tok | 1739 ms   |   gen 4 tok | 407 ms | 9.8 tok/s
+
   you > /think
+
   thinking ON — the model will reason before answering
+
   you > 用 Python 编写一个简单的快速排序算法实现。
+
   [think]
 好的，用户让我用Python写一个快速排序的实现。首先，我需要回忆一下快速排序的基本原理。快速排序的核心是分治法，把数组分成两部分，然后递归地对这两部分进行排序。
 
@@ -81,9 +86,13 @@ print(sorted_arr) # 输出: [1,3,4,5,6,8]
 
 该实现通过分治策略将数组分成两部分，分别递归排序后合并得到最终结果。
   prefill 60 tok | 2076 ms   |   gen 433 tok | 54667 ms | 7.9 tok/s
+
   you > /think
+
   thinking OFF — direct answers only
+
   you > 用 Rust 编程语言重写这段代码。
+
   aI  > ``rust
 fn quick_sort(arr: &[i32]) -> Vec<i32> {
     if arr.len() <= 1 {
