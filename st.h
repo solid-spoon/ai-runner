@@ -19,10 +19,9 @@
 #  include <unistd.h>
 #endif
 
-// Metadata describing a single tensor stored in a safetensors file.
 struct TensorInfo {
     std::string name;
-    std::string dtype;               // "F32", "BF16", "F16", "I32", "I64", ...
+    std::string dtype;
     std::vector<int64_t> shape;
     size_t offset_begin = 0;
     size_t offset_end = 0;
@@ -45,7 +44,6 @@ struct TensorInfo {
     size_t nbytes() const { return numel() * elem_size(); }
 };
 
-// Memory-mapped safetensors file. Non-copyable.
 class SafeTensors {
 public:
     explicit SafeTensors(const std::string& path) { open(path); }
@@ -65,7 +63,6 @@ public:
     const auto& all() const { return tensors_; }
     size_t size() const { return tensors_.size(); }
 
-    // Converts a tensor to a freshly-allocated FP32 buffer.
     static std::vector<float> to_f32(const TensorInfo& t) {
         const size_t n = t.numel();
         std::vector<float> out(n);
@@ -103,7 +100,8 @@ public:
             }
         }
         else {
-            throw std::runtime_error("cannot convert dtype: " + t.dtype);
+            throw std::runtime_error(
+                "cannot convert tensor '" + t.name + "' of dtype " + t.dtype + " to F32");
         }
         return out;
     }
@@ -115,30 +113,38 @@ private:
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
             nullptr);
         if (hFile_ == INVALID_HANDLE_VALUE)
-            throw std::runtime_error("cannot open: " + path);
+            throw std::runtime_error("cannot open (Win32 err=" +
+                std::to_string(GetLastError()) + "): " + path);
 
         LARGE_INTEGER sz;
         GetFileSizeEx(hFile_, &sz);
         mmap_size_ = static_cast<size_t>(sz.QuadPart);
 
         hMap_ = CreateFileMappingA(hFile_, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!hMap_) throw std::runtime_error("CreateFileMapping failed");
+        if (!hMap_) throw std::runtime_error("CreateFileMapping failed for " + path);
 
         mmap_ptr_ = MapViewOfFile(hMap_, FILE_MAP_READ, 0, 0, 0);
-        if (!mmap_ptr_) throw std::runtime_error("MapViewOfFile failed");
+        if (!mmap_ptr_) throw std::runtime_error("MapViewOfFile failed for " + path);
 #else
         fd_ = ::open(path.c_str(), O_RDONLY);
         if (fd_ < 0) throw std::runtime_error("cannot open: " + path);
 
         struct stat st {};
-        if (fstat(fd_, &st) != 0) throw std::runtime_error("fstat failed");
+        if (fstat(fd_, &st) != 0) throw std::runtime_error("fstat failed: " + path);
         mmap_size_ = static_cast<size_t>(st.st_size);
 
         mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (mmap_ptr_ == MAP_FAILED) throw std::runtime_error("mmap failed");
+        if (mmap_ptr_ == MAP_FAILED) throw std::runtime_error("mmap failed: " + path);
 #endif
         base_ = static_cast<const uint8_t*>(mmap_ptr_);
+        std::fprintf(stderr, "[st] opened %s (%.2f MB)\n",
+            path.c_str(), static_cast<double>(mmap_size_) / 1e6);
+
+        if (mmap_size_ < 8)
+            throw std::runtime_error("file too small to be safetensors: " + path);
+
         parse();
+        std::fprintf(stderr, "[st] parsed %zu tensors\n", tensors_.size());
     }
 
     void close() {
@@ -152,10 +158,11 @@ private:
 #endif
     }
 
-    // Minimal JSON parser for the safetensors header block.
     void parse() {
         uint64_t header_len;
         std::memcpy(&header_len, base_, 8);
+        if (header_len > mmap_size_ - 8)
+            throw std::runtime_error("safetensors header_len exceeds file size");
         const std::string h(reinterpret_cast<const char*>(base_) + 8,
             static_cast<size_t>(header_len));
         const uint8_t* data_base = base_ + 8 + header_len;
@@ -179,7 +186,6 @@ private:
             expect('"');
             return s;
         };
-        // Advances past any JSON value without parsing it.
         auto skip_value = [&]() {
             skip_ws();
             if (i >= h.size()) return;
@@ -228,7 +234,6 @@ private:
             const std::string key = read_string();
             skip_ws(); expect(':'); skip_ws();
 
-            // Ignore the optional __metadata__ block.
             if (key == "__metadata__") {
                 skip_value();
                 skip_ws();
@@ -285,6 +290,25 @@ private:
                 skip_ws();
                 if (i < h.size() && h[i] == ',') ++i;
             }
+
+            if (t.dtype.empty())
+                throw std::runtime_error("tensor '" + t.name + "' missing dtype");
+            if (t.offset_end < t.offset_begin)
+                throw std::runtime_error("tensor '" + t.name + "' has inverted data_offsets");
+            if (data_base + t.offset_end > base_ + mmap_size_)
+                throw std::runtime_error("tensor '" + t.name + "' data_offsets exceed file size");
+
+            const size_t expect_bytes = t.numel() * t.elem_size();
+            const size_t actual_bytes = t.offset_end - t.offset_begin;
+            if (actual_bytes != expect_bytes) {
+                char msg[256];
+                std::snprintf(msg, sizeof(msg),
+                    "tensor '%s' byte size mismatch: shape/numel implies %zu bytes, "
+                    "but data_offsets span %zu bytes",
+                    t.name.c_str(), expect_bytes, actual_bytes);
+                throw std::runtime_error(msg);
+            }
+
             t.ptr = data_base + t.offset_begin;
             tensors_[key] = std::move(t);
 

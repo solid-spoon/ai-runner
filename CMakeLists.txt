@@ -27,6 +27,6 @@ else()
 endif()
 
 target_sources(airun PRIVATE
-    st.h st_writer.h tokenizer.h matmul.h quant.h
+    st.h st_writer.h config.h tokenizer.h matmul.h quant.h
     model.h sampler.h agent.h ui.h
 )

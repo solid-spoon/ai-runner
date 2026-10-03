@@ -1,47 +1,36 @@
-// cpp/model.h — Qwen2 forward pass with flat KV cache.
+ï»¿// cpp/model.h â€” generic Qwen2/Qwen3 forward pass.
 #pragma once
 
 #include "st.h"
 #include "matmul.h"
 #include "quant.h"
+#include "config.h"
 
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <vector>
 #include <string>
-
-struct Qwen2Config {
-    int   hidden_size = 896;
-    int   num_attention_heads = 14;
-    int   num_key_value_heads = 2;
-    int   num_hidden_layers = 24;
-    int   intermediate_size = 4864;
-    int   vocab_size = 151936;
-    float rms_norm_eps = 1e-6f;
-    float rope_theta = 1000000.0f;
-    int   max_position_embeddings = 32768;
-};
+#include <stdexcept>
 
 inline constexpr int kMaxPrefill = 1024;
-// Bump this if you need longer context. Memory cost is
-//   2 * NL * kMaxContext * KVD * 4 bytes
-//   = 2 * 24 * 8192 * 128 * 4 = ~201 MB for kMaxContext=8192.
 inline constexpr int kMaxContext = 8192;
 
-class Qwen2Model {
+class QwenModel {
 public:
-    Qwen2Config cfg;
+    ModelConfig cfg;
 
-    int H, NH, NKV, NL, HD, KVD, INTER, VOCAB, GROUPS;
+    int H, NH, NKV, NL, HD, KVD, Q_DIM, INTER, VOCAB, GROUPS;
     float RMS_EPS, ROPE_THETA;
 
     Int8Tensor embed;
+    Int8Tensor lm_head;
     std::vector<float> finalNorm;
 
     struct Layer {
         std::vector<float> inputNorm;
         std::vector<float> postNorm;
+        std::vector<float> q_norm, k_norm;
 
         Int8Tensor q_w, k_w, v_w, o_w;
         std::vector<float> q_b, k_b, v_b;
@@ -50,88 +39,108 @@ public:
     };
     std::vector<Layer> layers;
 
-    // Flat KV cache.
-    //   Layout: kv_k_flat[li * (kMaxContext * KVD) + t * KVD + c]
-    //   li = layer in [0, NL), t = position, c = channel in [0, KVD).
-    //   All layers share a single kv_len_ — they always have the same length.
-    std::vector<float> kv_k_flat;
-    std::vector<float> kv_v_flat;
+    std::vector<float> kv_k_flat, kv_v_flat;
     int kv_len_ = 0;
 
-    // Single-token scratch.
     std::vector<float> x, xNorm;
     std::vector<float> q, k, v, attnOut, oProj;
     std::vector<float> gate, up, mlp;
     std::vector<float> logits;
     std::vector<float> scores;
 
-    // Batched (prefill) scratch.
     std::vector<float> Xb, Xnb, Qb, Kb, Vb, AttnOutb, OProjb;
     std::vector<float> Gateb, Upb, Mlb;
     std::vector<float> scores_buf;
 
-    explicit Qwen2Model(const SafeTensors& st, const Qwen2Config& c = {})
-        : cfg(c) {
+    explicit QwenModel(const SafeTensors& st, const ModelConfig& mc)
+        : cfg(mc) {
         H = cfg.hidden_size;
         NH = cfg.num_attention_heads;
-        NKV = cfg.num_key_value_heads;
+        NKV = cfg.effective_kv_heads();
+        HD = cfg.effective_head_dim();
         NL = cfg.num_hidden_layers;
-        HD = H / NH;
         KVD = NKV * HD;
+        Q_DIM = NH * HD;
         INTER = cfg.intermediate_size;
         VOCAB = cfg.vocab_size;
         RMS_EPS = cfg.rms_norm_eps;
         ROPE_THETA = cfg.rope_theta;
         GROUPS = NH / NKV;
 
+        cfg.use_qk_norm = st.has("model.layers.0.self_attn.q_norm.weight");
+        const bool has_bias = st.has("model.layers.0.self_attn.q_proj.bias");
+        const bool has_lm_head = st.has("lm_head.weight");
+        const bool tied = !has_lm_head;
+
         std::fprintf(stderr,
-            "[model] H=%d NH=%d NKV=%d NL=%d HD=%d KVD=%d INTER=%d VOCAB=%d\n",
-            H, NH, NKV, NL, HD, KVD, INTER, VOCAB);
+            "[model] type=%s H=%d NH=%d NKV=%d HD=%d Q_DIM=%d KVD=%d NL=%d INTER=%d VOCAB=%d\n",
+            cfg.model_type.c_str(), H, NH, NKV, HD, Q_DIM, KVD, NL, INTER, VOCAB);
         std::fprintf(stderr,
-            "[model] flat KV cache: %d layers x %d positions x %d ch = %.1f MB\n",
-            NL, kMaxContext, KVD,
-            (2.0 * NL * kMaxContext * KVD * 4) / 1e6);
+            "[model] qk_norm=%d  attn_bias=%d  tied_embed=%d\n",
+            cfg.use_qk_norm ? 1 : 0, has_bias ? 1 : 0, tied ? 1 : 0);
+
+        // â”€â”€ helpers with strict validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        auto require = [&](const std::string& name) {
+            if (!st.has(name))
+                throw std::runtime_error("missing tensor: " + name);
+        };
+
+        auto shape_str = [](const TensorInfo& t) {
+            std::string s = "[";
+            for (size_t i = 0; i < t.shape.size(); ++i) {
+                if (i) s += ",";
+                s += std::to_string(t.shape[i]);
+            }
+            s += "]";
+            return s;
+        };
+
+        auto check_shape = [&](const std::string& name, int r, int c) {
+            const TensorInfo& t = st[name];
+            if ((int)t.shape.size() != 2 ||
+                (int)t.shape[0] != r || (int)t.shape[1] != c) {
+                throw std::runtime_error(
+                    "tensor '" + name + "' has shape " + shape_str(t) +
+                    ", expected [" + std::to_string(r) + "," + std::to_string(c) + "]");
+            }
+        };
 
         auto load = [&](const std::string& name) {
+            require(name);
             return SafeTensors::to_f32(st[name]);
         };
-
+        auto load_optional = [&](const std::string& name, int n) -> std::vector<float> {
+            (void)n;
+            if (!st.has(name)) return {};
+            return SafeTensors::to_f32(st[name]);
+        };
         auto load_int8 = [&](const std::string& name,
             int rows, int cols) -> Int8Tensor {
-                Int8Tensor t;
-                t.rows = rows;
-                t.cols = cols;
-
+                Int8Tensor t; t.rows = rows; t.cols = cols;
                 const TensorInfo& w = st[name];
-                const TensorInfo& s = st[name + ".scale"];
-
-                t.data.assign(
-                    reinterpret_cast<const int8_t*>(w.ptr),
+                t.data.assign(reinterpret_cast<const int8_t*>(w.ptr),
                     reinterpret_cast<const int8_t*>(w.ptr) + w.numel());
-
-                t.scales = SafeTensors::to_f32(s);
+                t.scales = SafeTensors::to_f32(st[name + ".scale"]);
                 return t;
         };
-
         auto load_linear = [&](const std::string& name,
             int rows, int cols) -> Int8Tensor {
-                if (st.has(name + ".scale")) {
-                    return load_int8(name, rows, cols);
-                }
+                require(name);
+                check_shape(name, rows, cols);
+                if (st.has(name + ".scale")) return load_int8(name, rows, cols);
                 auto fp32 = SafeTensors::to_f32(st[name]);
                 return quantize_per_channel(fp32, rows, cols);
         };
 
-        const bool prequant =
-            st.has("model.layers.0.self_attn.q_proj.weight.scale");
-        std::fprintf(stderr, "[model] linear weights: %s\n",
-            prequant ? "pre-quantized INT8 (fast load)"
-            : "FP32/BF16 (quantizing on the fly)");
-
-        // RoPE cos/sin cache.
         init_rope_cache(HD, ROPE_THETA);
 
+        std::fprintf(stderr, "[model] loading embed (%d x %d)...\n", VOCAB, H);
         embed = load_linear("model.embed_tokens.weight", VOCAB, H);
+
+        if (!tied) {
+            std::fprintf(stderr, "[model] loading lm_head (%d x %d)...\n", VOCAB, H);
+            lm_head = load_linear("lm_head.weight", VOCAB, H);
+        }
         finalNorm = load("model.norm.weight");
 
         layers.resize(NL);
@@ -142,90 +151,89 @@ public:
             L.inputNorm = load(p + "input_layernorm.weight");
             L.postNorm = load(p + "post_attention_layernorm.weight");
 
-            L.q_w = load_linear(p + "self_attn.q_proj.weight", H, H);
+            if (cfg.use_qk_norm) {
+                L.q_norm = load(p + "self_attn.q_norm.weight");
+                L.k_norm = load(p + "self_attn.k_norm.weight");
+            }
+
+            L.q_w = load_linear(p + "self_attn.q_proj.weight", Q_DIM, H);
             L.k_w = load_linear(p + "self_attn.k_proj.weight", KVD, H);
             L.v_w = load_linear(p + "self_attn.v_proj.weight", KVD, H);
-            L.o_w = load_linear(p + "self_attn.o_proj.weight", H, H);
+            L.o_w = load_linear(p + "self_attn.o_proj.weight", H, Q_DIM);
 
             L.gate_w = load_linear(p + "mlp.gate_proj.weight", INTER, H);
             L.up_w = load_linear(p + "mlp.up_proj.weight", INTER, H);
             L.down_w = load_linear(p + "mlp.down_proj.weight", H, INTER);
 
-            L.q_b = load(p + "self_attn.q_proj.bias");
-            L.k_b = load(p + "self_attn.k_proj.bias");
-            L.v_b = load(p + "self_attn.v_proj.bias");
+            if (has_bias) {
+                L.q_b = load_optional(p + "self_attn.q_proj.bias", Q_DIM);
+                L.k_b = load_optional(p + "self_attn.k_proj.bias", KVD);
+                L.v_b = load_optional(p + "self_attn.v_proj.bias", KVD);
+            }
+
+            if ((i + 1) % 4 == 0 || i == NL - 1)
+                std::fprintf(stderr, "[model] layer %d/%d loaded\n", i + 1, NL);
         }
         std::fprintf(stderr, "[model] weights loaded\n");
 
-        // Flat KV cache — one allocation per matrix.
-        const size_t kv_size =
-            static_cast<size_t>(NL) * kMaxContext * KVD;
+        const size_t kv_size = static_cast<size_t>(NL) * kMaxContext * KVD;
+        std::fprintf(stderr, "[model] KV cache: %d layers x %d ctx x %d ch = %.1f MB each (x2)\n",
+            NL, kMaxContext, KVD, (double)kv_size * 4 / 1e6);
+
         kv_k_flat.assign(kv_size, 0.0f);
         kv_v_flat.assign(kv_size, 0.0f);
         kv_len_ = 0;
 
-        // Single-token buffers.
-        x.assign(H, 0);          xNorm.assign(H, 0);
-        q.assign(H, 0);          k.assign(KVD, 0);    v.assign(KVD, 0);
-        attnOut.assign(H, 0);    oProj.assign(H, 0);
-        gate.assign(INTER, 0);   up.assign(INTER, 0); mlp.assign(H, 0);
+        x.assign(H, 0);        xNorm.assign(H, 0);
+        q.assign(Q_DIM, 0);    k.assign(KVD, 0);  v.assign(KVD, 0);
+        attnOut.assign(Q_DIM, 0);
+        oProj.assign(H, 0);
+        gate.assign(INTER, 0); up.assign(INTER, 0); mlp.assign(H, 0);
         logits.assign(VOCAB, 0);
         scores.assign(kMaxContext, 0);
 
-        // Batched buffers.
-        Xb.assign(static_cast<size_t>(kMaxPrefill) * H, 0);
-        Xnb.assign(static_cast<size_t>(kMaxPrefill) * H, 0);
-        Qb.assign(static_cast<size_t>(kMaxPrefill) * H, 0);
-        Kb.assign(static_cast<size_t>(kMaxPrefill) * KVD, 0);
-        Vb.assign(static_cast<size_t>(kMaxPrefill) * KVD, 0);
-        AttnOutb.assign(static_cast<size_t>(kMaxPrefill) * H, 0);
-        OProjb.assign(static_cast<size_t>(kMaxPrefill) * H, 0);
-        Gateb.assign(static_cast<size_t>(kMaxPrefill) * INTER, 0);
-        Upb.assign(static_cast<size_t>(kMaxPrefill) * INTER, 0);
-        Mlb.assign(static_cast<size_t>(kMaxPrefill) * H, 0);
+        Xb.assign((size_t)kMaxPrefill * H, 0);
+        Xnb.assign((size_t)kMaxPrefill * H, 0);
+        Qb.assign((size_t)kMaxPrefill * Q_DIM, 0);
+        Kb.assign((size_t)kMaxPrefill * KVD, 0);
+        Vb.assign((size_t)kMaxPrefill * KVD, 0);
+        AttnOutb.assign((size_t)kMaxPrefill * Q_DIM, 0);
+        OProjb.assign((size_t)kMaxPrefill * H, 0);
+        Gateb.assign((size_t)kMaxPrefill * INTER, 0);
+        Upb.assign((size_t)kMaxPrefill * INTER, 0);
+        Mlb.assign((size_t)kMaxPrefill * H, 0);
         scores_buf.assign(kMaxContext, 0);
     }
 
-    // O(1) — íèêàêîãî îáõîäà 24 ñëî¸â.
     void reset_kv() { kv_len_ = 0; }
+    int  kv_len() const { return kv_len_; }
 
-    int kv_len() const { return kv_len_; }
-
-    // Pointer to the start of (layer li, position t) inside the flat K cache.
     inline float* k_at(int li, int t) {
-        return kv_k_flat.data()
-            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
-    }
-    inline const float* k_at(int li, int t) const {
-        return kv_k_flat.data()
-            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
+        return kv_k_flat.data() + ((size_t)li * kMaxContext + t) * KVD;
     }
     inline float* v_at(int li, int t) {
-        return kv_v_flat.data()
-            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
+        return kv_v_flat.data() + ((size_t)li * kMaxContext + t) * KVD;
+    }
+    inline const float* k_at(int li, int t) const {
+        return kv_k_flat.data() + ((size_t)li * kMaxContext + t) * KVD;
     }
     inline const float* v_at(int li, int t) const {
-        return kv_v_flat.data()
-            + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
+        return kv_v_flat.data() + ((size_t)li * kMaxContext + t) * KVD;
     }
 
     inline void embed_lookup(int token_id, float* __restrict out) const {
-        const int8_t* row = embed.data.data()
-            + static_cast<size_t>(token_id) * H;
+        const int8_t* row = embed.data.data() + (size_t)token_id * H;
         const float sc = embed.scales[token_id];
-        for (int i = 0; i < H; ++i) out[i] = static_cast<float>(row[i]) * sc;
+        for (int i = 0; i < H; ++i) out[i] = (float)row[i] * sc;
     }
 
-    // ??? Single-token forward ?????????????????????????????????
     const float* forward(int token_id, int position) {
-        // Guard against overflow.
         if (kv_len_ >= kMaxContext) {
             std::fprintf(stderr, "[warn] context full, resetting KV cache\n");
             reset_kv();
             position = 0;
         }
-
-        const int pos = kv_len_;   // position we're writing this token at
+        const int pos = kv_len_;
 
         embed_lookup(token_id, x.data());
 
@@ -234,26 +242,34 @@ public:
 
             rms_norm(x.data(), L.inputNorm.data(), H, RMS_EPS, xNorm.data());
 
-            matvec_int8_parallel(xNorm.data(), H, L.q_w, L.q_b.data(), q.data(), H);
-            matvec_int8_parallel(xNorm.data(), H, L.k_w, L.k_b.data(), k.data(), KVD);
-            matvec_int8_parallel(xNorm.data(), H, L.v_w, L.v_b.data(), v.data(), KVD);
+            matvec_int8_parallel(xNorm.data(), H, L.q_w,
+                L.q_b.empty() ? nullptr : L.q_b.data(), q.data(), Q_DIM);
+            matvec_int8_parallel(xNorm.data(), H, L.k_w,
+                L.k_b.empty() ? nullptr : L.k_b.data(), k.data(), KVD);
+            matvec_int8_parallel(xNorm.data(), H, L.v_w,
+                L.v_b.empty() ? nullptr : L.v_b.data(), v.data(), KVD);
+
+            if (cfg.use_qk_norm) {
+                for (int h = 0; h < NH; ++h)
+                    rms_norm(q.data() + h * HD, L.q_norm.data(), HD, RMS_EPS,
+                        q.data() + h * HD);
+                for (int h = 0; h < NKV; ++h)
+                    rms_norm(k.data() + h * HD, L.k_norm.data(), HD, RMS_EPS,
+                        k.data() + h * HD);
+            }
 
             for (int h = 0; h < NH; ++h)
                 apply_rope(q.data(), h * HD, HD, pos, ROPE_THETA);
             for (int h = 0; h < NKV; ++h)
                 apply_rope(k.data(), h * HD, HD, pos, ROPE_THETA);
 
-            // Write this position into the flat cache.
             std::memcpy(k_at(li, pos), k.data(), KVD * sizeof(float));
             std::memcpy(v_at(li, pos), v.data(), KVD * sizeof(float));
 
             const int seq_len = pos + 1;
-
-            const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
-            const float* kbase = kv_k_flat.data()
-                + static_cast<size_t>(li) * kMaxContext * KVD;
-            const float* vbase = kv_v_flat.data()
-                + static_cast<size_t>(li) * kMaxContext * KVD;
+            const float scale = 1.0f / std::sqrt((float)HD);
+            const float* kbase = kv_k_flat.data() + (size_t)li * kMaxContext * KVD;
+            const float* vbase = kv_v_flat.data() + (size_t)li * kMaxContext * KVD;
 
             for (int h = 0; h < NH; ++h) {
                 const int kv_head = h / GROUPS;
@@ -261,7 +277,7 @@ public:
                 const int kv_off = kv_head * HD;
 
                 for (int t = 0; t < seq_len; ++t) {
-                    const float* kt = kbase + static_cast<size_t>(t) * KVD + kv_off;
+                    const float* kt = kbase + (size_t)t * KVD + kv_off;
                     float s = 0.0f;
                     for (int d = 0; d < HD; ++d) s += q[q_off + d] * kt[d];
                     scores[t] = s * scale;
@@ -271,12 +287,12 @@ public:
                 for (int d = 0; d < HD; ++d) {
                     float s = 0.0f;
                     for (int t = 0; t < seq_len; ++t)
-                        s += scores[t] * vbase[static_cast<size_t>(t) * KVD + kv_off + d];
+                        s += scores[t] * vbase[(size_t)t * KVD + kv_off + d];
                     attnOut[q_off + d] = s;
                 }
             }
 
-            matvec_int8_parallel(attnOut.data(), H, L.o_w, nullptr,
+            matvec_int8_parallel(attnOut.data(), Q_DIM, L.o_w, nullptr,
                 oProj.data(), H);
             for (int i = 0; i < H; ++i) x[i] += oProj[i];
 
@@ -295,41 +311,32 @@ public:
         }
 
         rms_norm(x.data(), finalNorm.data(), H, RMS_EPS, xNorm.data());
-        matvec_int8_parallel(xNorm.data(), H, embed, nullptr,
+        const Int8Tensor& head = cfg.tie_word_embeddings ? embed : lm_head;
+        matvec_int8_parallel(xNorm.data(), H, head, nullptr,
             logits.data(), VOCAB);
 
         kv_len_++;
         return logits.data();
     }
 
-    // ??? Batched forward (prefill) ????????????????????????????
     const float* forward_batch(const std::vector<int>& tokens) {
-        int N = static_cast<int>(tokens.size());
+        int N = (int)tokens.size();
         if (N == 0) return logits.data();
-
         if (N > kMaxPrefill) {
             std::vector<int> tail(tokens.end() - kMaxPrefill, tokens.end());
             return forward_batch(tail);
         }
-
-        // Guard against context overflow.
         if (kv_len_ + N > kMaxContext) {
-            std::fprintf(stderr,
-                "[warn] context would overflow (%d + %d > %d), resetting\n",
-                kv_len_, N, kMaxContext);
             reset_kv();
             if (N > kMaxContext) {
                 std::vector<int> tail(tokens.end() - kMaxContext, tokens.end());
                 return forward_batch(tail);
             }
         }
-
         const int past_len = kv_len_;
 
-        // Embedding lookup.
-        for (int t = 0; t < N; ++t) {
-            embed_lookup(tokens[t], Xb.data() + static_cast<size_t>(t) * H);
-        }
+        for (int t = 0; t < N; ++t)
+            embed_lookup(tokens[t], Xb.data() + (size_t)t * H);
 
         for (int li = 0; li < NL; ++li) {
             Layer& L = layers[li];
@@ -337,37 +344,45 @@ public:
             rms_norm_batch(Xb.data(), N, H, L.inputNorm.data(),
                 RMS_EPS, Xnb.data());
 
-            matvec_int8_batch(Xnb.data(), N, H, L.q_w, L.q_b.data(),
-                Qb.data(), H);
-            matvec_int8_batch(Xnb.data(), N, H, L.k_w, L.k_b.data(),
-                Kb.data(), KVD);
-            matvec_int8_batch(Xnb.data(), N, H, L.v_w, L.v_b.data(),
-                Vb.data(), KVD);
+            matvec_int8_batch(Xnb.data(), N, H, L.q_w,
+                L.q_b.empty() ? nullptr : L.q_b.data(), Qb.data(), Q_DIM);
+            matvec_int8_batch(Xnb.data(), N, H, L.k_w,
+                L.k_b.empty() ? nullptr : L.k_b.data(), Kb.data(), KVD);
+            matvec_int8_batch(Xnb.data(), N, H, L.v_w,
+                L.v_b.empty() ? nullptr : L.v_b.data(), Vb.data(), KVD);
+
+            if (cfg.use_qk_norm) {
+                for (int t = 0; t < N; ++t) {
+                    float* qrow = Qb.data() + (size_t)t * Q_DIM;
+                    for (int h = 0; h < NH; ++h)
+                        rms_norm(qrow + h * HD, L.q_norm.data(), HD, RMS_EPS,
+                            qrow + h * HD);
+                    float* krow = Kb.data() + (size_t)t * KVD;
+                    for (int h = 0; h < NKV; ++h)
+                        rms_norm(krow + h * HD, L.k_norm.data(), HD, RMS_EPS,
+                            krow + h * HD);
+                }
+            }
 
             for (int t = 0; t < N; ++t) {
                 const int pos = past_len + t;
                 for (int h = 0; h < NH; ++h)
-                    apply_rope(Qb.data(), t * H + h * HD, HD, pos, ROPE_THETA);
+                    apply_rope(Qb.data(), t * Q_DIM + h * HD, HD, pos, ROPE_THETA);
                 for (int h = 0; h < NKV; ++h)
                     apply_rope(Kb.data(), t * KVD + h * HD, HD, pos, ROPE_THETA);
             }
 
-            // Write N new positions into the flat cache.
             for (int t = 0; t < N; ++t) {
                 std::memcpy(k_at(li, past_len + t),
-                    Kb.data() + static_cast<size_t>(t) * KVD,
-                    KVD * sizeof(float));
+                    Kb.data() + (size_t)t * KVD, KVD * sizeof(float));
                 std::memcpy(v_at(li, past_len + t),
-                    Vb.data() + static_cast<size_t>(t) * KVD,
-                    KVD * sizeof(float));
+                    Vb.data() + (size_t)t * KVD, KVD * sizeof(float));
             }
 
-            const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+            const float scale = 1.0f / std::sqrt((float)HD);
             float* sc = scores_buf.data();
-            const float* kbase = kv_k_flat.data()
-                + static_cast<size_t>(li) * kMaxContext * KVD;
-            const float* vbase = kv_v_flat.data()
-                + static_cast<size_t>(li) * kMaxContext * KVD;
+            const float* kbase = kv_k_flat.data() + (size_t)li * kMaxContext * KVD;
+            const float* vbase = kv_v_flat.data() + (size_t)li * kMaxContext * KVD;
 
             for (int h = 0; h < NH; ++h) {
                 const int kv_head = h / GROUPS;
@@ -375,12 +390,10 @@ public:
                 const int kv_off = kv_head * HD;
 
                 for (int t1 = 0; t1 < N; ++t1) {
-                    const float* qrow =
-                        Qb.data() + static_cast<size_t>(t1) * H + q_off;
+                    const float* qrow = Qb.data() + (size_t)t1 * Q_DIM + q_off;
                     const int cnt = past_len + t1 + 1;
-
                     for (int t2 = 0; t2 < cnt; ++t2) {
-                        const float* krow = kbase + static_cast<size_t>(t2) * KVD + kv_off;
+                        const float* krow = kbase + (size_t)t2 * KVD + kv_off;
                         __m128 sum = _mm_setzero_ps();
                         int d = 0;
                         for (; d + 4 <= HD; d += 4) {
@@ -394,18 +407,17 @@ public:
                     }
                     softmax_inplace(sc, cnt);
 
-                    float* orow =
-                        AttnOutb.data() + static_cast<size_t>(t1) * H + q_off;
+                    float* orow = AttnOutb.data() + (size_t)t1 * Q_DIM + q_off;
                     for (int d = 0; d < HD; ++d) orow[d] = 0.0f;
                     for (int t2 = 0; t2 < cnt; ++t2) {
                         const float w = sc[t2];
-                        const float* vrow = vbase + static_cast<size_t>(t2) * KVD + kv_off;
+                        const float* vrow = vbase + (size_t)t2 * KVD + kv_off;
                         for (int d = 0; d < HD; ++d) orow[d] += w * vrow[d];
                     }
                 }
             }
 
-            matvec_int8_batch(AttnOutb.data(), N, H, L.o_w, nullptr,
+            matvec_int8_batch(AttnOutb.data(), N, Q_DIM, L.o_w, nullptr,
                 OProjb.data(), H);
             for (int i = 0; i < N * H; ++i) Xb[i] += OProjb[i];
 
@@ -426,8 +438,9 @@ public:
 
         rms_norm_batch(Xb.data(), N, H, finalNorm.data(), RMS_EPS, Xnb.data());
 
-        const float* last_xn = Xnb.data() + static_cast<size_t>(N - 1) * H;
-        matvec_int8_parallel(last_xn, H, embed, nullptr,
+        const float* last_xn = Xnb.data() + (size_t)(N - 1) * H;
+        const Int8Tensor& head = cfg.tie_word_embeddings ? embed : lm_head;
+        matvec_int8_parallel(last_xn, H, head, nullptr,
             logits.data(), VOCAB);
 
         kv_len_ += N;
