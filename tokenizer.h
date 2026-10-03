@@ -1,10 +1,9 @@
-﻿// cpp/tokenizer.h — Qwen2/Qwen3 BPE tokenizer (byte-level, configurable specials).
-#pragma once
-
+﻿#pragma once
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <cctype>
+#include <climits>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -88,15 +87,11 @@ inline std::unordered_map<std::string, int>
 parse_vocab_json(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open vocab: " + path);
-
     std::stringstream ss; ss << f.rdbuf();
     const std::string s = ss.str();
-
     std::unordered_map<std::string, int> out;
     out.reserve(160000);
-
     size_t i = 0; const size_t n = s.size();
-
     auto skip_ws = [&]() {
         while (i < n && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t')) ++i;
     };
@@ -129,6 +124,22 @@ parse_vocab_json(const std::string& path) {
                         else if (h >= 'A' && h <= 'F') cp |= (h - 'A' + 10);
                     }
                     i += 4;
+                    // Фикс суррогатных пар: \uD83D\uDE00 должен стать одним кодом.
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < n &&
+                        s[i + 1] == '\\' && s[i + 2] == 'u') {
+                        uint32_t cp2 = 0;
+                        for (int k = 3; k <= 6; ++k) {
+                            const char h = s[i + k];
+                            cp2 <<= 4;
+                            if (h >= '0' && h <= '9')      cp2 |= (h - '0');
+                            else if (h >= 'a' && h <= 'f') cp2 |= (h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') cp2 |= (h - 'A' + 10);
+                        }
+                        if (cp2 >= 0xDC00 && cp2 <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (cp2 - 0xDC00);
+                            i += 6;
+                        }
+                    }
                     r += utf8_encode(cp);
                     break;
                 }
@@ -143,7 +154,6 @@ parse_vocab_json(const std::string& path) {
         ++i;
         return r;
     };
-
     skip_ws();
     if (i >= n || s[i] != '{') throw std::runtime_error("expected {");
     ++i;
@@ -195,14 +205,10 @@ parse_merges_txt(const std::string& path) {
 // ─── Tokenizer ─────────────────────────────────────────────
 class Qwen2Tokenizer {
 public:
-    // `specials` — vector of {token_string, token_id}.
-    //   Qwen2 (vocab=151936): {{"<|endoftext|>",151643},{"<|im_start|>",151644},{"<|im_end|>",151645}}
-    //   Qwen3 / MiniMind:     {{"<|endoftext|>",0},{"<|im_start|>",1},{"<|im_end|>",2}}
     Qwen2Tokenizer(const std::string& vocab_path,
         const std::string& merges_path,
         const std::vector<std::pair<std::string, int>>& specials)
         : specials_(specials) {
-
         for (const auto& bu : byte_uni_table()) {
             byte_to_uni_[bu.first] = utf8_encode(bu.second);
             uni_to_byte_[bu.second] = bu.first;
@@ -210,16 +216,13 @@ public:
         encoder_ = parse_vocab_json(vocab_path);
         bpe_ranks_ = parse_merges_txt(merges_path);
         for (const auto& kv : encoder_) decoder_[kv.second] = kv.first;
-
         for (const auto& sp : specials_) {
             if (encoder_.find(sp.first) == encoder_.end())
                 encoder_[sp.first] = sp.second;
             decoder_[sp.second] = sp.first;
             special_ids_.insert(sp.second);
         }
-
-        std::fprintf(stderr,
-            "[tokenizer] vocab: %zu, merges: %zu, specials: %zu\n",
+        std::fprintf(stderr, "[tokenizer] vocab=%zu merges=%zu specials=%zu\n",
             encoder_.size(), bpe_ranks_.size(), specials_.size());
     }
 
@@ -230,24 +233,17 @@ public:
         size_t last = 0;
         size_t pos = 0;
         while (pos < text.size()) {
-            // Try to match any special (longest wins) at this position.
             int matched_id = -1;
             size_t matched_len = 0;
             for (const auto& sp : specials_) {
                 const size_t len = sp.first.size();
-                if (pos + len <= text.size() &&
-                    text.compare(pos, len, sp.first) == 0) {
-                    if (len > matched_len) {
-                        matched_id = sp.second;
-                        matched_len = len;
-                    }
+                if (text.compare(pos, len, sp.first) == 0 && len > matched_len) {
+                    matched_id = sp.second;
+                    matched_len = len;
                 }
             }
             if (matched_id >= 0) {
-                if (pos > last) {
-                    const auto sub = encode_text(text.substr(last, pos - last));
-                    ids.insert(ids.end(), sub.begin(), sub.end());
-                }
+                if (pos > last) append_segment(text, last, pos - last, ids);
                 ids.push_back(matched_id);
                 pos += matched_len;
                 last = pos;
@@ -255,10 +251,7 @@ public:
             }
             ++pos;
         }
-        if (last < text.size()) {
-            const auto sub = encode_text(text.substr(last));
-            ids.insert(ids.end(), sub.begin(), sub.end());
-        }
+        if (last < text.size()) append_segment(text, last, text.size() - last, ids);
         return ids;
     }
 
@@ -296,21 +289,21 @@ private:
     std::string byte_to_uni_[256];
     std::unordered_map<uint32_t, uint8_t> uni_to_byte_;
 
-    std::vector<int> encode_text(const std::string& text) const {
-        std::vector<int> ids;
-        const auto pieces = split_pieces(text);
+    // Один сегмент между спешиалами. Работает без подстрок на каждый кусок.
+    void append_segment(const std::string& text, size_t off, size_t len,
+        std::vector<int>& ids) const {
+        const std::string seg = text.substr(off, len);
+        const auto pieces = split_pieces(seg);
         for (const auto& p : pieces) {
-            const std::string piece = text.substr(p.first, p.second);
             std::string bpe_input;
-            bpe_input.reserve(piece.size() * 2);
-            for (size_t k = 0; k < piece.size(); ++k)
-                bpe_input += byte_to_uni_[static_cast<uint8_t>(piece[k])];
+            bpe_input.reserve(p.second * 2);
+            for (size_t k = 0; k < p.second; ++k)
+                bpe_input += byte_to_uni_[static_cast<uint8_t>(seg[p.first + k])];
             for (const auto& w : bpe(bpe_input)) {
                 auto it = encoder_.find(w);
                 if (it != encoder_.end()) ids.push_back(it->second);
             }
         }
-        return ids;
     }
 
     std::vector<std::pair<size_t, size_t>>
@@ -319,7 +312,7 @@ private:
         size_t i = 0;
         const size_t n = text.size();
         while (i < n) {
-            // 1. Contraction
+            // 1. Контракция ('s, 't, 're, 've, 'll, ...)
             if (text[i] == '\'') {
                 int matched = 0;
                 if (i + 1 < n) {
@@ -331,12 +324,9 @@ private:
                             matched = 3;
                     }
                 }
-                if (matched > 0) {
-                    pieces.push_back({ i, (size_t)matched });
-                    i += matched; continue;
-                }
+                if (matched > 0) { pieces.push_back({ i, (size_t)matched }); i += matched; continue; }
             }
-            // 2. Letter run, or punct+letter
+            // 2. Запуск букв, либо пунктуация+буквы.
             {
                 const auto cl = utf8_decode(text, i);
                 if (is_letter_cp(cl.first)) {
@@ -364,15 +354,12 @@ private:
                     }
                 }
             }
-            // 3. Single digit
+            // 3. Одиночная цифра.
             {
                 const auto cl = utf8_decode(text, i);
-                if (is_digit_cp(cl.first)) {
-                    pieces.push_back({ i, (size_t)cl.second });
-                    i += cl.second; continue;
-                }
+                if (is_digit_cp(cl.first)) { pieces.push_back({ i, (size_t)cl.second }); i += cl.second; continue; }
             }
-            // 4. Optional space + punctuation
+            // 4. Пробел+пунктуация, либо чистая пунктуация.
             {
                 size_t j = i; bool ok = false;
                 if (text[i] == ' ') {
@@ -402,7 +389,7 @@ private:
                     pieces.push_back({ i, k - i }); i = k; continue;
                 }
             }
-            // 5. Whitespace chunk
+            // 5. Пробельный чанк.
             {
                 const auto cl = utf8_decode(text, i);
                 if (is_whitespace_cp(cl.first)) {
@@ -426,10 +413,7 @@ private:
                     }
                     else {
                         const size_t cnt = ws.size();
-                        size_t to_match;
-                        if (k >= n) to_match = cnt;
-                        else if (cnt == 1) to_match = 1;
-                        else to_match = cnt - 1;
+                        size_t to_match = (k >= n) ? cnt : (cnt == 1 ? 1 : cnt - 1);
                         size_t end = i;
                         for (size_t c = 0; c < to_match; ++c) end += ws[c].second;
                         pieces.push_back({ i, end - i }); i = end;

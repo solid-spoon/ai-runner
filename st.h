@@ -1,6 +1,4 @@
-﻿// cpp/st.h — Safetensors reader with mmap (Windows + POSIX).
-#pragma once
-
+﻿#pragma once
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -11,12 +9,12 @@
 #include <stdexcept>
 
 #ifdef _WIN32
-#  include <windows.h>
+#include <windows.h>
 #else
-#  include <sys/mman.h>
-#  include <sys/stat.h>
-#  include <fcntl.h>
-#  include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 struct TensorInfo {
@@ -32,7 +30,6 @@ struct TensorInfo {
         for (auto s : shape) n *= static_cast<size_t>(s);
         return n;
     }
-
     size_t elem_size() const {
         if (dtype == "F32" || dtype == "I32") return 4;
         if (dtype == "F16" || dtype == "BF16") return 2;
@@ -40,15 +37,12 @@ struct TensorInfo {
         if (dtype == "I64") return 8;
         throw std::runtime_error("unknown dtype: " + dtype);
     }
-
-    size_t nbytes() const { return numel() * elem_size(); }
 };
 
 class SafeTensors {
 public:
     explicit SafeTensors(const std::string& path) { open(path); }
     ~SafeTensors() { close(); }
-
     SafeTensors(const SafeTensors&) = delete;
     SafeTensors& operator=(const SafeTensors&) = delete;
 
@@ -58,15 +52,12 @@ public:
             throw std::runtime_error("tensor not found: " + name);
         return it->second;
     }
-
     bool has(const std::string& name) const { return tensors_.count(name) > 0; }
-    const auto& all() const { return tensors_; }
     size_t size() const { return tensors_.size(); }
 
     static std::vector<float> to_f32(const TensorInfo& t) {
         const size_t n = t.numel();
         std::vector<float> out(n);
-
         if (t.dtype == "F32") {
             std::memcpy(out.data(), t.ptr, n * 4);
         }
@@ -110,8 +101,7 @@ private:
     void open(const std::string& path) {
 #ifdef _WIN32
         hFile_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-            nullptr);
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile_ == INVALID_HANDLE_VALUE)
             throw std::runtime_error("cannot open (Win32 err=" +
                 std::to_string(GetLastError()) + "): " + path);
@@ -137,14 +127,11 @@ private:
         if (mmap_ptr_ == MAP_FAILED) throw std::runtime_error("mmap failed: " + path);
 #endif
         base_ = static_cast<const uint8_t*>(mmap_ptr_);
-        std::fprintf(stderr, "[st] opened %s (%.2f MB)\n",
-            path.c_str(), static_cast<double>(mmap_size_) / 1e6);
 
         if (mmap_size_ < 8)
             throw std::runtime_error("file too small to be safetensors: " + path);
 
         parse();
-        std::fprintf(stderr, "[st] parsed %zu tensors\n", tensors_.size());
     }
 
     void close() {
@@ -163,9 +150,15 @@ private:
         std::memcpy(&header_len, base_, 8);
         if (header_len > mmap_size_ - 8)
             throw std::runtime_error("safetensors header_len exceeds file size");
+
         const std::string h(reinterpret_cast<const char*>(base_) + 8,
             static_cast<size_t>(header_len));
         const uint8_t* data_base = base_ + 8 + header_len;
+
+        // Доступное число байт после заголовка. Считаем через вычитание,
+        // чтобы не полагаться на указательную арифметику с size_t, которая
+        // может переполниться на специально сконструированном файле.
+        const size_t avail = mmap_size_ - 8 - static_cast<size_t>(header_len);
 
         size_t i = 0;
         auto skip_ws = [&]() {
@@ -190,7 +183,6 @@ private:
             skip_ws();
             if (i >= h.size()) return;
             const char c = h[i];
-
             if (c == '"') {
                 ++i;
                 while (i < h.size() && h[i] != '"') {
@@ -259,10 +251,17 @@ private:
                     while (true) {
                         skip_ws();
                         if (h[i] == ']') { ++i; break; }
+
+                        // Фикс бесконечного цикла: проверяем что символ - цифра
+                        if (h[i] < '0' || h[i] > '9') {
+                            throw std::runtime_error("invalid character in shape at " + std::to_string(i));
+                        }
+
                         int64_t v = 0;
                         while (i < h.size() && h[i] >= '0' && h[i] <= '9')
                             v = v * 10 + (h[i++] - '0');
                         t.shape.push_back(v);
+
                         skip_ws();
                         if (h[i] == ',') ++i;
                     }
@@ -274,10 +273,17 @@ private:
                     while (true) {
                         skip_ws();
                         if (h[i] == ']') { ++i; break; }
+
+                        // Фикс бесконечного цикла
+                        if (h[i] < '0' || h[i] > '9') {
+                            throw std::runtime_error("invalid character in data_offsets at " + std::to_string(i));
+                        }
+
                         size_t v = 0;
                         while (i < h.size() && h[i] >= '0' && h[i] <= '9')
                             v = v * 10 + (h[i++] - '0');
                         if (vi < 2) vals[vi++] = v;
+
                         skip_ws();
                         if (h[i] == ',') ++i;
                     }
@@ -287,6 +293,7 @@ private:
                 else {
                     skip_value();
                 }
+
                 skip_ws();
                 if (i < h.size() && h[i] == ',') ++i;
             }
@@ -295,7 +302,9 @@ private:
                 throw std::runtime_error("tensor '" + t.name + "' missing dtype");
             if (t.offset_end < t.offset_begin)
                 throw std::runtime_error("tensor '" + t.name + "' has inverted data_offsets");
-            if (data_base + t.offset_end > base_ + mmap_size_)
+            // Проверяем через avail: смещение не может превышать
+            // размер данных после заголовка.
+            if (t.offset_end > avail)
                 throw std::runtime_error("tensor '" + t.name + "' data_offsets exceed file size");
 
             const size_t expect_bytes = t.numel() * t.elem_size();
@@ -319,14 +328,12 @@ private:
 
     void* mmap_ptr_ = nullptr;
     size_t mmap_size_ = 0;
-
 #ifdef _WIN32
     HANDLE hFile_ = nullptr;
     HANDLE hMap_ = nullptr;
 #else
     int fd_ = -1;
 #endif
-
     const uint8_t* base_ = nullptr;
     std::unordered_map<std::string, TensorInfo> tensors_;
 };

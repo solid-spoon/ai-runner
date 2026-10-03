@@ -1,127 +1,93 @@
 ```bash
-> x64\Release\airun.exe --quantize models\Qwen3-0.6B\model.safetensors models\Qwen3-0.6B-int8\model.safetensors
+> x64\Release\airun.exe models\Qwen2.5-0.5B-Instruct-int8\model.safetensors models\Qwen2.5-0.5B-Instruct-int8\vocab.json models\Qwen2.5-0.5B-Instruct-int8\merges.txt
 
-[quantize] reading models\Qwen3-0.6B\model.safetensors
-[config] type=qwen3 H=1024 NH=16 NKV=8 HD=128 NL=28 INTER=3072 VOCAB=151936 eps=1e-06 rope=1e+06 tie=1 attn_bias=0
-[quantize] H=1024 NH=16 NKV=8 HD=128 Q_DIM=2048 KVD=1024 NL=28 INTER=3072 VOCAB=151936
-[quantize] layer 4/28
-[quantize] layer 8/28
-[quantize] layer 12/28
-[quantize] layer 16/28
-[quantize] layer 20/28
-[quantize] layer 24/28
-[quantize] layer 28/28
-[quantize] writing models\Qwen3-0.6B-int8\model.safetensors...
-[quantize] done
-```
+[main] argc=4
+[main]   argv[0] = "x64\Release\airun.exe"
+[main]   argv[1] = "models\Qwen2.5-0.5B-Instruct-int8\model.safetensors"
+[main]   argv[2] = "models\Qwen2.5-0.5B-Instruct-int8\vocab.json"
+[main]   argv[3] = "models\Qwen2.5-0.5B-Instruct-int8\merges.txt"
+[main] model file: 496.12 MB
+[load] safetensors: 0.7 ms (459 tensors)
+[tokenizer] vocab=151646 merges=151387 specials=3
+[load] tokenizer: 176.5 ms (vocab=151646)
+[model] qwen2 H=896 NH=14 NKV=2 HD=64 NL=24 INTER=4864 VOCAB=151936 qk_norm=0 bias=1 tied=1
+[model] weights loaded, KV cache 201.3 MB
+[load] model: 535.9 ms
 
-```bash
-> x64\Release\airun.exe models\Qwen3-0.6B-int8\model.safetensors models\Qwen3-0.6B-int8\vocab.json models\Qwen3-0.6B-int8\merges.txt
-
-[load] safetensors: 1.1 ms (507 tensors)
-[config] type=qwen3 H=1024 NH=16 NKV=8 HD=128 NL=28 INTER=3072 VOCAB=151936 eps=1e-06 rope=1e+06 tie=1 attn_bias=0
-[tokenizer] vocab: 151648, merges: 151387, specials: 5
-[load] tokenizer: 208.6 ms (vocab=151648)
-[model] type=qwen3 H=1024 NH=16 NKV=8 HD=128 Q_DIM=2048 KVD=1024 NL=28 INTER=3072 VOCAB=151936
-[model] qk_norm=1  attn_bias=0  tied_embed=1
-[rope] cache initialized (8192 positions ? 64 dims)
-[model] weights loaded
-[load] model: 1483.9 ms
-
-  +----------------------------------------------------------------------------+
-  |                                                                            |
-  | Qwen3                                                                      |
-  | native C++ inference - SSE2 + threads                                      |
-  |                                                                            |
-  | type /help for commands, /exit to quit                                     |
-  |                                                                            |
-  +----------------------------------------------------------------------------+
+  airun  ·  Qwen2.5
+  type /help for commands, /exit to quit
 
 
-  -- commands -------------------------------------------------------------
-  |  /reset  /clear  /think  /temp <n>  /help  /exit
-  ----------------------------------------------------------------------------
-  this model supports /think — toggle reasoning mode
-  you > Hi
+▌ you › Hi
+▌ ai
+Hello! How can I assist you today?
 
-  aI  > Hello! 😊
-  prefill 38 tok | 1739 ms   |   gen 4 tok | 407 ms | 9.8 tok/s
+▌ you › 用 Python 编写一个简单的快速排序算法实现。
+▌ ai
+当然可以！以下是一个使用 Python 实现的简单快速排序算法：
 
-  you > /think
+┌── code · python
+│ def quick_sort(arr):
+│     if len(arr) <= 1:
+│         return arr
+│     else:
+│         pivot = arr[len(arr) // 2]
+│         left = [x for x in arr if x < pivot]
+│         middle = [x for x in arr if x == pivot]
+│         right = [x for x in arr if x > pivot]
+│         return quick_sort(left) + middle + quick_sort(right)
+│
+│ # 示例用法
+│ if __name__ == "__main__":
+│     # 创建一个简单的有序数组
+│     arr = [3, 6, 8, 10, 1, 2, 1]
+│
+│     print("原始数组:", arr)
+│
+│     sorted_arr = quick_sort(arr)
+│
+│     print("排序后的数组:", sorted_arr)
+└──
 
-  thinking ON — the model will reason before answering
+这个快速排序算法的基本思想是：选择一个“基准”元素（这里选的是数组的中间元素），然后将所有比基准小的元素移动到基准前面，将所有比基准大的元素移动到基准后面。然后重复上述步骤，直到整个数组被排序完成。
 
-  you > 用 Python 编写一个简单的快速排序算法实现。
+▌ you › 用 Rust 编程语言重写这段代码。
+▌ ai
+当然可以！以下是使用 Rust 编程语言重写的快速排序算法：
 
-  [think]
-好的，用户让我用Python写一个快速排序的实现。首先，我需要回忆一下快速排序的基本原理。快速排序的核心是分治法，把数组分成两部分，然后递归地对这两部分进行排序。
+┌── code · rust
+│ fn quick_sort(arr: &mut [i32]) {
+│     if arr.len() <= 1 {
+│         return;
+│     }
+│     let pivot = arr[arr.len() / 2];
+│     let mut left = Vec::new();
+│     let mut middle = Vec::new();
+│     let mut right = Vec::new();
+│
+│     for &x in &arr {
+│         if x < pivot {
+│             left.push(x);
+│         } else if x == pivot {
+│             middle.push(x);
+│         } else {
+│             right.push(x);
+│         }
+│     }
+│
+│     quick_sort(&mut left);
+│     quick_sort(&mut middle);
+│     quick_sort(&mut right);
+│
+│     arr.copy_from_slice(&left);
+│     arr.copy_from_slice(&middle);
+│     arr.copy_from_slice(&right);
+│ }
+└──
 
-接下来，我得考虑如何实现这个过程。通常的做法是选择一个基准元素（比如第一个元素），将数组分成小于基准的和大于基准的部分。然后对这两个子数组分别进行排序。这里可能需要处理边界情况，比如当整个数组只有一个元素时，或者当所有元素都相同的情况。
+这个 Rust 实现使用了 `Vec` 类型来存储排序后的元素，这样可以避免在数组中直接操作元素的情况。通过递归调用 `quick_sort` 函 数来处理子问题，最终将整个数组排序完成。
 
-然后，我需要考虑如何实现递归部分。Python的列表推导式可以用来生成新的列表。例如，将小于基准的元素放到左边，大于基准的部分放到右边。这样就能得到排序后的数组。
-
-用户可能没有明确说明是否需要处理特殊情况，比如当数组为空或只有一个元素时的情况。这时候我应该在代码中添加一些基本的条件判断，确保程序能够正确运行。
-
-另外，要注意变量名的命名是否符合Python习惯。通常用列表来存储结果，基准元素也可以用变量名表示。这样代码更清晰易读。
-
-最后，测试一下这个实现是否能正确排序数组。可能需要提供一些示例输入和输出来验证结果是否正确。比如，测试一个简单的数组，看看快速排序的处理是否正确。
-
-
-  aI  > 以下是使用Python实现的快速排序算法：
-
-``python
-def quick_sort(arr):
-    if len(arr) <= 1:
-        return arr
-    pivot = arr[0]
-    left = [x for x in arr if x < pivot]
-    right = [x for x in arr if x > pivot]
-    return quick_sort(left) + [pivot] + quick_sort(right)
-
-# 示例使用
-arr = [3, 8, 1, 5, 4, 6]
-sorted_arr = quick_sort(arr)
-print(sorted_arr) # 输出: [1,3,4,5,6,8]
-``
-
-该实现通过分治策略将数组分成两部分，分别递归排序后合并得到最终结果。
-  prefill 60 tok | 2076 ms   |   gen 433 tok | 54667 ms | 7.9 tok/s
-
-  you > /think
-
-  thinking OFF — direct answers only
-
-  you > 用 Rust 编程语言重写这段代码。
-
-  aI  > ``rust
-fn quick_sort(arr: &[i32]) -> Vec<i32> {
-    if arr.len() <= 1 {
-        return arr.to_vec();
-    }
-
-    // 选择第一个元素作为基准点
-    let pivot = arr[0];
-
-    // 左边的元素小于等于基准点
-    let left = &arr[..arr.iter().position(|&x| x == pivot).unwrap()];
-
-    // 右边的元素大于等于基准点
-    let right = &arr[(arr.len() - 1)..];
-
-    quick_sort(left).to_vec() + vec![pivot] + quick_sort(right)
-}
-
-fn main() {
-    let arr = [3, 8, 1, 5, 4, 6];
-    let sorted_arr = quick_sort(&arr);
-    println!("Sorted array: {:?}", sorted_arr);
-}
-``
-  prefill 525 tok | 27350 ms   |   gen 185 tok | 41178 ms | 4.5 tok/s
-  you > /exit
-
-  bye.
-
+▌ you › /exit
 
 ```
 

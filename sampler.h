@@ -1,107 +1,149 @@
-// cpp/sampler.h — Token sampling with temperature, top-k, top-p and repetition penalty.
 #pragma once
-
 #include <vector>
 #include <algorithm>
-#include <random>
 #include <cmath>
+#include <random>
+#include <numeric>
+#include <cstring>
 
 struct SamplerConfig {
     float temperature = 0.7f;
     int   top_k = 20;
     float top_p = 0.8f;
     float repetition_penalty = 1.05f;
-    int   repetition_window = 64;
+    int   presence_penalty = 0;
+    float frequency_penalty = 0.0f;
+    int   repetition_window = 128;   // учитывать только последние N токенов
 };
 
 class Sampler {
-public:
-    explicit Sampler(uint32_t seed = 42) : rng_(seed) {}
-
-    // Samples a token id from logits. `logits` is not modified; a copy is
-    // used internally. `recent_tokens` drives the repetition penalty.
-    int sample(const float* logits, int n, const SamplerConfig& cfg,
-        const std::vector<int>& recent_tokens) {
-        std::vector<float> scaled(logits, logits + n);
-
-        // Temperature scaling.
-        const float inv_t = 1.0f / std::max(cfg.temperature, 1e-6f);
-        for (int i = 0; i < n; ++i) scaled[i] *= inv_t;
-
-        // Repetition penalty.
-        if (cfg.repetition_penalty != 1.0f && !recent_tokens.empty()) {
-            const int start = std::max(
-                0, static_cast<int>(recent_tokens.size()) - cfg.repetition_window);
-            for (int j = start; j < static_cast<int>(recent_tokens.size()); ++j) {
-                const int t = recent_tokens[j];
-                if (t < 0 || t >= n) continue;
-                if (scaled[t] > 0) scaled[t] /= cfg.repetition_penalty;
-                else                scaled[t] *= cfg.repetition_penalty;
-            }
-        }
-
-        // Softmax.
-        float mx = scaled[0];
-        for (int i = 1; i < n; ++i) if (scaled[i] > mx) mx = scaled[i];
-
-        float sum = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            scaled[i] = std::exp(scaled[i] - mx);
-            sum += scaled[i];
-        }
-        const float inv = 1.0f / sum;
-        for (int i = 0; i < n; ++i) scaled[i] *= inv;
-
-        // Top-k filtering.
-        if (cfg.top_k > 0 && cfg.top_k < n) {
-            std::vector<int> idx(n);
-            for (int i = 0; i < n; ++i) idx[i] = i;
-            std::partial_sort(idx.begin(), idx.begin() + cfg.top_k, idx.end(),
-                [&](int a, int b) { return scaled[a] > scaled[b]; });
-            const float cutoff = scaled[idx[cfg.top_k - 1]];
-            for (int i = 0; i < n; ++i) if (scaled[i] < cutoff) scaled[i] = 0.0f;
-        }
-
-        // Top-p (nucleus) filtering.
-        if (cfg.top_p < 1.0f) {
-            std::vector<int> idx(n);
-            for (int i = 0; i < n; ++i) idx[i] = i;
-            std::sort(idx.begin(), idx.end(),
-                [&](int a, int b) { return scaled[a] > scaled[b]; });
-
-            std::vector<char> keep(n, 0);
-            float cum = 0.0f;
-            for (int i = 0; i < n; ++i) {
-                cum += scaled[idx[i]];
-                keep[idx[i]] = 1;
-                if (cum >= cfg.top_p) break;
-            }
-            for (int i = 0; i < n; ++i) if (!keep[i]) scaled[i] = 0.0f;
-        }
-
-        // Renormalize and sample.
-        float total = 0.0f;
-        for (int i = 0; i < n; ++i) total += scaled[i];
-        if (total <= 0.0f) return 0;
-
-        std::uniform_real_distribution<float> dist(0.0f, total);
-        const float r = dist(rng_);
-        float c = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            c += scaled[i];
-            if (r < c) return i;
-        }
-        return n - 1;
-    }
-
-    // Greedy decoding helper.
-    static int argmax(const float* logits, int n) {
-        int best = 0;
-        for (int i = 1; i < n; ++i)
-            if (logits[i] > logits[best]) best = i;
-        return best;
-    }
-
-private:
     std::mt19937 rng_;
+    std::vector<float> probs_;
+    std::vector<int> indices_;
+    std::vector<int> recent_buf_;
+
+public:
+    Sampler() {
+        std::random_device rd;
+        rng_.seed(rd());
+    }
+
+    void ensure_capacity(int vocab_size) {
+        if ((int)probs_.size() < vocab_size) {
+            probs_.resize(vocab_size);
+            indices_.resize(vocab_size);
+        }
+    }
+
+    void apply_penalties(float* logits, int vocab_size,
+        const std::vector<int>& recent,
+        const SamplerConfig& cfg) {
+        if (recent.empty() || (cfg.repetition_penalty == 1.0f &&
+            cfg.presence_penalty == 0 && cfg.frequency_penalty == 0.0f))
+            return;
+
+        // Окно: смотрим только на последние repetition_window токенов.
+        // Это ограничивает стоимость и не подавляет слова, встречавшиеся
+        // очень давно в промпте.
+        const int start = (cfg.repetition_window > 0 &&
+            (int)recent.size() > cfg.repetition_window)
+            ? (int)recent.size() - cfg.repetition_window : 0;
+
+        recent_buf_.assign(recent.begin() + start, recent.end());
+        std::sort(recent_buf_.begin(), recent_buf_.end());
+
+        int i = 0;
+        int n = (int)recent_buf_.size();
+        while (i < n) {
+            int token = recent_buf_[i];
+            int count = 1;
+            while (i + count < n && recent_buf_[i + count] == token) count++;
+
+            if (token >= 0 && token < vocab_size) {
+                if (cfg.repetition_penalty != 1.0f) {
+                    if (logits[token] > 0) logits[token] /= cfg.repetition_penalty;
+                    else logits[token] *= cfg.repetition_penalty;
+                }
+                if (cfg.presence_penalty != 0) {
+                    logits[token] -= (float)cfg.presence_penalty;
+                }
+                if (cfg.frequency_penalty != 0.0f) {
+                    logits[token] -= cfg.frequency_penalty * (float)count;
+                }
+            }
+            i += count;
+        }
+    }
+
+    int sample(const float* logits, int vocab_size,
+        const SamplerConfig& cfg,
+        const std::vector<int>& recent_tokens) {
+        ensure_capacity(vocab_size);
+
+        std::memcpy(probs_.data(), logits, vocab_size * sizeof(float));
+        apply_penalties(probs_.data(), vocab_size, recent_tokens, cfg);
+
+        if (cfg.temperature <= 1e-5f) {
+            return (int)(std::max_element(probs_.data(), probs_.data() + vocab_size) - probs_.data());
+        }
+
+        if (cfg.temperature != 1.0f) {
+            float inv_t = 1.0f / cfg.temperature;
+            for (int i = 0; i < vocab_size; ++i) probs_[i] *= inv_t;
+        }
+
+        float max_val = *std::max_element(probs_.data(), probs_.data() + vocab_size);
+        float sum = 0.0f;
+        for (int i = 0; i < vocab_size; ++i) {
+            probs_[i] = std::exp(probs_[i] - max_val);
+            sum += probs_[i];
+        }
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < vocab_size; ++i) probs_[i] *= inv_sum;
+
+        // Ограничиваем кандидатов, чтобы не сортировать весь словарь (150k+).
+        // Если top_k не задан, берем лимит 2048, этого хватит для любого top_p.
+        int max_candidates = (cfg.top_k > 0 && cfg.top_k < vocab_size) ? cfg.top_k : 2048;
+        if (max_candidates > vocab_size) max_candidates = vocab_size;
+
+        std::iota(indices_.data(), indices_.data() + vocab_size, 0);
+
+        // O(N) поиск top-K кандидатов
+        std::nth_element(indices_.data(), indices_.data() + max_candidates,
+            indices_.data() + vocab_size,
+            [&](int a, int b) { return probs_[a] > probs_[b]; });
+
+        if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+            // Сортируем только отобранных кандидатов O(K log K)
+            std::sort(indices_.data(), indices_.data() + max_candidates,
+                [&](int a, int b) { return probs_[a] > probs_[b]; });
+
+            float cum_prob = 0.0f;
+            int cutoff = max_candidates;
+            for (int i = 0; i < max_candidates; ++i) {
+                cum_prob += probs_[indices_[i]];
+                if (cum_prob >= cfg.top_p) {
+                    cutoff = i + 1;
+                    break;
+                }
+            }
+            max_candidates = cutoff;
+        }
+
+        float new_sum = 0.0f;
+        for (int i = 0; i < max_candidates; ++i) {
+            new_sum += probs_[indices_[i]];
+        }
+
+        if (new_sum <= 0.0f) return indices_[0];
+
+        std::uniform_real_distribution<float> dist(0.0f, new_sum);
+        float r = dist(rng_);
+        float cum = 0.0f;
+        for (int i = 0; i < max_candidates; ++i) {
+            cum += probs_[indices_[i]];
+            if (cum >= r) return indices_[i];
+        }
+        return indices_[max_candidates - 1];
+    }
 };
