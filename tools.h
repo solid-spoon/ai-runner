@@ -1,7 +1,8 @@
-﻿#pragma once
+#pragma once
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -138,7 +139,6 @@ namespace tools {
                 s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r')
                 ++i;
             out.s = s.substr(start, i - start);
-
             return true;
         }
 
@@ -196,21 +196,41 @@ namespace tools {
 
     } // namespace json
 
+    // -----------------------------------------------------------------------
+    // Возвращает абсолютный канонический путь внутри sandbox-корня.
+    // На Windows канонизирует И корень, И полный путь: иначе короткие имена
+    // (RUNNER~1) в корне и развёрнутые (runneradmin) в full дают ложное
+    // "path escapes sandbox".
+    // -----------------------------------------------------------------------
     inline std::string safe_resolve(const Config& cfg, const std::string& rel) {
         namespace fs = std::filesystem;
         if (rel.empty()) throw std::runtime_error("empty path");
+
         fs::path root = cfg.root.empty() ? fs::current_path() : fs::path(cfg.root);
-        root = fs::absolute(root);
+
+        std::error_code ec;
+        fs::path root_abs = fs::absolute(root, ec);
+        if (ec) root_abs = root;
+        fs::path root_can = fs::weakly_canonical(root_abs, ec);
+        if (ec) root_can = root_abs;
+        root = root_can;
+
         fs::path p(rel);
         if (p.is_absolute()) throw std::runtime_error("absolute paths not allowed");
-        fs::path full = fs::weakly_canonical(root / p);
+
+        fs::path full = fs::weakly_canonical(root / p, ec);
+        if (ec) full = root / p;
+
         const std::string rs = root.string();
-        const std::string fs_str = full.string();
-        if (fs_str.size() < rs.size() || fs_str.compare(0, rs.size(), rs) != 0)
+        const std::string full_s = full.string();
+
+        if (full_s.size() < rs.size() || full_s.compare(0, rs.size(), rs) != 0)
             throw std::runtime_error("path escapes sandbox");
-        if (fs_str.size() > rs.size() && fs_str[rs.size()] != '/' && fs_str[rs.size()] != '\\')
+        if (full_s.size() > rs.size() &&
+            full_s[rs.size()] != '/' && full_s[rs.size()] != '\\')
             throw std::runtime_error("path escapes sandbox");
-        return fs_str;
+
+        return full_s;
     }
 
     inline Result read_file(const Config& cfg, const std::string& path) {
