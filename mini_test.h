@@ -1,6 +1,6 @@
-// mini_test.h — мини-замена gtest. C++17.
 #pragma once
 
+#include <algorithm>   // std::max
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -11,10 +11,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include <algorithm>   // std::max
 
 // ============================================================================
-// Скелет «testing::Test» — совместимость с существующими фикстурами
+// РЎРєРµР»РµС‚ В«testing::TestВ» - СЃРѕРІРјРµСЃС‚РёРјРѕСЃС‚СЊ СЃ СЃСѓС‰РµСЃС‚РІСѓСЋС‰РёРјРё С„РёРєСЃС‚СѓСЂР°РјРё
 // ============================================================================
 namespace testing {
     class Test {
@@ -29,7 +28,7 @@ namespace testing {
 namespace minitest {
 
     // ---------------------------------------------------------------------------
-    // Учёт неудач
+    // РЈС‡С‘С‚ РЅРµСѓРґР°С‡
     // ---------------------------------------------------------------------------
     struct FatalFailure {};
 
@@ -43,8 +42,27 @@ namespace minitest {
     }
 
     // ---------------------------------------------------------------------------
-    // Объект-контекст утверждения. Живёт до конца полного выражения, поэтому
-    // поддерживает цепочку `EXPECT_EQ(a,b) << "ctx=" << x;`
+    // SFINAE-С…РµР»РїРµСЂ: РїРµС‡Р°С‚Р°С‚СЊ Р·РЅР°С‡РµРЅРёРµ С‚РѕР»СЊРєРѕ РµСЃР»Рё РґР»СЏ РЅРµРіРѕ РµСЃС‚СЊ operator<<.
+    // РќСѓР¶РµРЅ, С‡С‚РѕР±С‹ EXPECT_EQ РЅР° РёС‚РµСЂР°С‚РѕСЂР°С…, std::filesystem::path Рё С‚.Рї.
+    // РєРѕРјРїРёР»РёСЂРѕРІР°Р»СЃСЏ (РІ gtest СЌС‚Рѕ РґРµР»Р°РµС‚ UniversalPrinter).
+    // ---------------------------------------------------------------------------
+    template <typename T, typename = void>
+    struct is_streamable : std::false_type {};
+
+    template <typename T>
+    struct is_streamable<T, std::void_t<
+        decltype(std::declval<std::ostream&>() << std::declval<const T&>())>>
+        : std::true_type {};
+
+    template <typename T>
+    void stream_or_placeholder(std::ostream& os, const T& v) {
+        if constexpr (is_streamable<T>::value) os << v;
+        else                                   os << "<unprintable>";
+    }
+
+    // ---------------------------------------------------------------------------
+    // РћР±СЉРµРєС‚-РєРѕРЅС‚РµРєСЃС‚ СѓС‚РІРµСЂР¶РґРµРЅРёСЏ. Р–РёРІС‘С‚ РґРѕ РєРѕРЅС†Р° РїРѕР»РЅРѕРіРѕ РІС‹СЂР°Р¶РµРЅРёСЏ, РїРѕСЌС‚РѕРјСѓ
+    // РїРѕРґРґРµСЂР¶РёРІР°РµС‚ С†РµРїРѕС‡РєСѓ `EXPECT_EQ(a,b) << "ctx=" << x;`
     // ---------------------------------------------------------------------------
     struct AssertionContext {
         const char* file;
@@ -64,7 +82,7 @@ namespace minitest {
             if (!passed) os << v;
             return *this;
         }
-        // Для std::hex, std::endl и прочих манипуляторов
+        // Р”Р»СЏ std::hex, std::endl Рё РїСЂРѕС‡РёС… РјР°РЅРёРїСѓР»СЏС‚РѕСЂРѕРІ
         AssertionContext& operator<<(std::ostream& (*m)(std::ostream&)) {
             if (!passed) m(os);
             return *this;
@@ -73,13 +91,16 @@ namespace minitest {
         ~AssertionContext() noexcept(false) {
             if (!passed) {
                 report_failure(file, line, os.str());
-                if (fatal) throw FatalFailure{};
+                // Р‘СЂРѕСЃР°РµРј FatalFailure С‚РѕР»СЊРєРѕ РµСЃР»Рё РЅРµС‚ Р°РєС‚РёРІРЅРѕР№ СЂР°СЃРєСЂСѓС‚РєРё -
+                // РёРЅР°С‡Рµ РїРѕР»СѓС‡РёРј std::terminate.
+                if (fatal && std::uncaught_exceptions() == 0)
+                    throw FatalFailure{};
             }
         }
     };
 
     // ---------------------------------------------------------------------------
-    // Фабрики для бинарных сравнений (==, !=, <, <=, >, >=)
+    // Р¤Р°Р±СЂРёРєРё РґР»СЏ Р±РёРЅР°СЂРЅС‹С… СЃСЂР°РІРЅРµРЅРёР№ (==, !=, <, <=, >, >=)
     // ---------------------------------------------------------------------------
     template <typename A, typename B>
     struct CmpAssertion : AssertionContext {
@@ -87,9 +108,9 @@ namespace minitest {
             const char* as, const char* op, const char* bs, A a_, B b_)
             : AssertionContext(f, l, fatal, ok) {
             if (!ok) {
-                os << "Expected: " << as << " " << op << " " << bs << "\n"
-                    << "  LHS: " << a_ << "\n"
-                    << "  RHS: " << b_;
+                os << "Expected: " << as << " " << op << " " << bs << "\n";
+                os << "  LHS: "; stream_or_placeholder(os, a_);
+                os << "\n  RHS: "; stream_or_placeholder(os, b_);
             }
         }
     };
@@ -142,7 +163,7 @@ namespace minitest {
     }
 
     // ---------------------------------------------------------------------------
-    // Реестр тестов
+    // Р РµРµСЃС‚СЂ С‚РµСЃС‚РѕРІ
     // ---------------------------------------------------------------------------
     struct TestInfo {
         std::string suite;
@@ -170,7 +191,7 @@ namespace minitest {
                 t.fn();
             }
             catch (const FatalFailure&) {
-                // уже отчитались
+                // СѓР¶Рµ РѕС‚С‡РёС‚Р°Р»РёСЃСЊ
             }
             catch (const std::exception& e) {
                 report_failure("<unknown>", 0,
@@ -197,7 +218,7 @@ namespace minitest {
 } // namespace minitest
 
 // ============================================================================
-// Макросы TEST / TEST_F
+// РњР°РєСЂРѕСЃС‹ TEST / TEST_F
 // ============================================================================
 #define TEST(suite, name)                                                     \
     static void minitest_##suite##_##name##_body();                           \
@@ -223,7 +244,7 @@ namespace minitest {
     void minitest_fix_##fixture##_##name::TestBody()
 
 // ============================================================================
-// Утверждения
+// РЈС‚РІРµСЂР¶РґРµРЅРёСЏ
 // ============================================================================
 #define EXPECT_TRUE(cond)                                                     \
     (::minitest::AssertionContext(__FILE__, __LINE__, false,                  \
@@ -263,6 +284,15 @@ namespace minitest {
 #define ASSERT_LT(a, b)                                                       \
     ::minitest::make_cmp(__FILE__, __LINE__, true, #a, "<", #b, (a), (b),     \
         [](const auto& x, const auto& y) { return x < y; })
+#define ASSERT_LE(a, b)                                                       \
+    ::minitest::make_cmp(__FILE__, __LINE__, true, #a, "<=", #b, (a), (b),    \
+        [](const auto& x, const auto& y) { return x <= y; })
+#define ASSERT_GT(a, b)                                                       \
+    ::minitest::make_cmp(__FILE__, __LINE__, true, #a, ">", #b, (a), (b),     \
+        [](const auto& x, const auto& y) { return x > y; })
+#define ASSERT_GE(a, b)                                                       \
+    ::minitest::make_cmp(__FILE__, __LINE__, true, #a, ">=", #b, (a), (b),    \
+        [](const auto& x, const auto& y) { return x >= y; })
 
 #define EXPECT_NEAR(a, b, tol)                                                \
     ::minitest::make_near(__FILE__, __LINE__, false, #a, #b,                  \
@@ -273,7 +303,7 @@ namespace minitest {
         static_cast<float>(a), static_cast<float>(b))
 
 // ---------------------------------------------------------------------------
-// THROW / NO_THROW (без цепочки <<, как и в gtest)
+// THROW / NO_THROW (Р±РµР· С†РµРїРѕС‡РєРё <<, РєР°Рє Рё РІ gtest)
 // ---------------------------------------------------------------------------
 #define EXPECT_THROW(stmt, exc_type)                                          \
     do {                                                                      \
@@ -301,7 +331,7 @@ namespace minitest {
     } while (0)
 
 // ============================================================================
-// main() — линкуем в один .cpp
+// main() - Р»РёРЅРєСѓРµРј РІ РѕРґРёРЅ .cpp
 // ============================================================================
 #define MINITEST_MAIN                                                         \
     int main(int argc, char** argv) {                                         \
