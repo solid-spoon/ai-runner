@@ -1,6 +1,6 @@
 #pragma once
 
-#include <algorithm>   // std::max
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -12,9 +12,6 @@
 #include <utility>
 #include <vector>
 
-// ============================================================================
-// Скелет «testing::Test» - совместимость с существующими фикстурами
-// ============================================================================
 namespace testing {
     class Test {
     public:
@@ -26,10 +23,6 @@ namespace testing {
 }
 
 namespace minitest {
-
-    // ---------------------------------------------------------------------------
-    // Учёт неудач
-    // ---------------------------------------------------------------------------
     struct FatalFailure {};
 
     inline int& g_total_failures() { static int n = 0; return n; }
@@ -41,11 +34,6 @@ namespace minitest {
         ++g_current_failed();
     }
 
-    // ---------------------------------------------------------------------------
-    // SFINAE-хелпер: печатать значение только если для него есть operator<<.
-    // Нужен, чтобы EXPECT_EQ на итераторах, std::filesystem::path и т.п.
-    // компилировался (в gtest это делает UniversalPrinter).
-    // ---------------------------------------------------------------------------
     template <typename T, typename = void>
     struct is_streamable : std::false_type {};
 
@@ -60,10 +48,6 @@ namespace minitest {
         else                                   os << "<unprintable>";
     }
 
-    // ---------------------------------------------------------------------------
-    // Объект-контекст утверждения. Живёт до конца полного выражения, поэтому
-    // поддерживает цепочку `EXPECT_EQ(a,b) << "ctx=" << x;`
-    // ---------------------------------------------------------------------------
     struct AssertionContext {
         const char* file;
         int line;
@@ -82,7 +66,6 @@ namespace minitest {
             if (!passed) os << v;
             return *this;
         }
-        // Для std::hex, std::endl и прочих манипуляторов
         AssertionContext& operator<<(std::ostream& (*m)(std::ostream&)) {
             if (!passed) m(os);
             return *this;
@@ -99,9 +82,6 @@ namespace minitest {
         }
     };
 
-    // ---------------------------------------------------------------------------
-    // Фабрики для бинарных сравнений (==, !=, <, <=, >, >=)
-    // ---------------------------------------------------------------------------
     template <typename A, typename B>
     struct CmpAssertion : AssertionContext {
         CmpAssertion(const char* f, int l, bool fatal, bool ok,
@@ -129,9 +109,6 @@ namespace minitest {
             std::move(a_copy), std::move(b_copy));
     }
 
-    // ---------------------------------------------------------------------------
-    // NEAR / FLOAT_EQ
-    // ---------------------------------------------------------------------------
     struct NearAssertion : AssertionContext {
         NearAssertion(const char* f, int l, bool fatal, bool ok,
             const char* as, const char* bs,
@@ -162,9 +139,6 @@ namespace minitest {
             as, bs, a, b, tol);
     }
 
-    // ---------------------------------------------------------------------------
-    // Реестр тестов
-    // ---------------------------------------------------------------------------
     struct TestInfo {
         std::string suite;
         std::string name;
@@ -217,9 +191,6 @@ namespace minitest {
 
 } // namespace minitest
 
-// ============================================================================
-// Макросы TEST / TEST_F
-// ============================================================================
 #define TEST(suite, name)                                                     \
     static void minitest_##suite##_##name##_body();                           \
     static ::minitest::Registrar minitest_reg_##suite##_##name(               \
@@ -243,9 +214,6 @@ namespace minitest {
         });                                                                   \
     void minitest_fix_##fixture##_##name::TestBody()
 
-// ============================================================================
-// Утверждения
-// ============================================================================
 #define EXPECT_TRUE(cond)                                                     \
     (::minitest::AssertionContext(__FILE__, __LINE__, false,                  \
         static_cast<bool>(cond)) << "EXPECT_TRUE(" #cond ") failed")
@@ -302,9 +270,6 @@ namespace minitest {
     ::minitest::make_float_eq(__FILE__, __LINE__, false, #a, #b,              \
         static_cast<float>(a), static_cast<float>(b))
 
-// ---------------------------------------------------------------------------
-// THROW / NO_THROW (без цепочки <<, как и в gtest)
-// ---------------------------------------------------------------------------
 #define EXPECT_THROW(stmt, exc_type)                                          \
     do {                                                                      \
         bool _mt_threw = false;                                               \
@@ -330,9 +295,6 @@ namespace minitest {
         }                                                                     \
     } while (0)
 
-// ============================================================================
-// main() - линкуем в один .cpp
-// ============================================================================
 #define MINITEST_MAIN                                                         \
     int main(int argc, char** argv) {                                         \
         return ::minitest::run_all(argc, argv);                               \
