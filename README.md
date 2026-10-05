@@ -91,4 +91,4 @@ Hello! How can I assist you today?
 
 ```
 
-Developed and Runs on Pentium G5420 without AVX2.
+Runs on Pentium G5420 without AVX2.

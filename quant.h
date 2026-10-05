@@ -7,7 +7,6 @@
 #include <thread>
 #include "matmul.h"
 
-// Per-channel INT8 tensor: one scale per output row.
 struct Int8Tensor {
     std::vector<int8_t> data;    // [rows * cols]
     std::vector<float>  scales;  // [rows]
@@ -18,7 +17,6 @@ struct Int8Tensor {
     bool empty() const { return data.empty(); }
 };
 
-// Quantize an FP32 matrix [rows, cols] (row-major) to per-channel INT8.
 inline Int8Tensor quantize_per_channel(const std::vector<float>& fp32,
     int rows, int cols) {
     Int8Tensor t;
@@ -50,7 +48,6 @@ inline Int8Tensor quantize_per_channel(const std::vector<float>& fp32,
     return t;
 }
 
-// Vectorized int8 dot product (SSE2 fallback, AVX2 if available).
 inline int32_t dot_int8_scalar(const int8_t* __restrict a,
     const int8_t* __restrict b, int n) {
 #if defined(__AVX2__)
@@ -97,7 +94,6 @@ inline int32_t dot_int8_scalar(const int8_t* __restrict a,
 #endif
 }
 
-// Single int8 matvec (sequential).
 inline void matvec_int8(const float* __restrict x, int in_dim,
     const Int8Tensor& W,
     const float* __restrict b,
@@ -111,7 +107,6 @@ inline void matvec_int8(const float* __restrict x, int in_dim,
     if (sx < 1e-9f) sx = 1e-9f;
     const float sx_inv = 1.0f / sx;
 
-    // Thread-local scratch: избегаем аллокации на каждый matvec.
     static thread_local std::vector<int8_t> x_q;
     if (static_cast<int>(x_q.size()) < in_dim) x_q.resize(in_dim);
 
@@ -130,7 +125,6 @@ inline void matvec_int8(const float* __restrict x, int in_dim,
     }
 }
 
-// Parallel int8 matvec.
 struct Int8Task {
     const int8_t* xq;
     const Int8Tensor* W;
@@ -169,9 +163,6 @@ inline void matvec_int8_parallel(const float* __restrict x, int in_dim,
     if (sx < 1e-9f) sx = 1e-9f;
     const float sx_inv = 1.0f / sx;
 
-    // Thread-local scratch: этот vector создаётся один раз на поток
-    // вызывающего и переиспользуется между вызовами. Worker-потоки
-    // читают через .data(), гонки нет.
     static thread_local std::vector<int8_t> x_q;
     if (static_cast<int>(x_q.size()) < in_dim) x_q.resize(in_dim);
     for (int i = 0; i < in_dim; ++i) {
@@ -196,7 +187,6 @@ inline void matvec_int8_parallel(const float* __restrict x, int in_dim,
     for (auto& th : pool) th.join();
 }
 
-// Batched int8 matvec (for prefill).
 inline void matvec_int8_batch(const float* __restrict X, int N, int in_dim,
     const Int8Tensor& W,
     const float* __restrict b,

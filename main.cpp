@@ -73,7 +73,7 @@ namespace {
                 {"<|im_start|>",  151644},
                 {"<|im_end|>",    151645},
             };
-        };
+        }
         return {
             {"<|endoftext|>",         0},
             {"<|im_start|>",          1},
@@ -116,14 +116,6 @@ namespace {
 } // namespace
 
 static int airun_main(int argc, char** argv) {
-    std::fprintf(stderr, "[main] argc=%d\n", argc);
-    for (int i = 0; i < argc; ++i)
-        std::fprintf(stderr, "[main]   argv[%d] = \"%s\"\n", i, argv[i]);
-
-    // ── --list / --extract-tokenizer / --quantize 子命令：完全保持原状 ──
-    //   （此处略，与原始文件逐字相同）
-
-    // ── 默认分支：线性 REPL ────────────────────────────────────────
     if (argc < 4) {
         std::fprintf(stderr,
             "usage: %s model.safetensors vocab.json merges.txt\n"
@@ -164,7 +156,6 @@ static int airun_main(int argc, char** argv) {
     t1 = std::chrono::high_resolution_clock::now();
     log_elapsed("model", t0, t1);
 
-    // ← 原 run_tui(model, tok, mc, argv[1]) 整体替换为：
     return run_agent(model, tok, mc);
 }
 

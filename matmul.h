@@ -15,14 +15,13 @@
 #include <algorithm>
 #include <immintrin.h>
 
-// ─── RoPE кэш ─────────────────────────────────────────────────
 static constexpr int kMaxRopeDim = 128;
 static constexpr int kMaxRopePos = 8192;
 
 struct RopeCache {
     bool inited = false;
-    float cos_tab[kMaxRopePos][kMaxRopeDim / 2];
-    float sin_tab[kMaxRopePos][kMaxRopeDim / 2];
+    float cos_tab[kMaxRopePos][kMaxRopeDim / 2] = {};
+    float sin_tab[kMaxRopePos][kMaxRopeDim / 2] = {};
 };
 
 inline RopeCache& rope_cache() {
@@ -49,7 +48,6 @@ inline void init_rope_cache(int head_dim, float theta_base) {
     c.inited = true;
 }
 
-// ─── Утилиты ──────────────────────────────────────────────────
 inline int num_threads() {
     const unsigned n = std::thread::hardware_concurrency();
     return n > 0 ? static_cast<int>(n) : 4;
@@ -63,7 +61,6 @@ inline float hsum_sse(__m128 v) {
     return _mm_cvtss_f32(sums);
 }
 
-// ─── RMSNorm (чистый SSE2, без SSE3) ──────────────────────────
 inline void rms_norm(const float* __restrict x,
     const float* __restrict gamma,
     int n, float eps, float* out) {
@@ -96,7 +93,6 @@ inline void rms_norm_batch(const float* __restrict X, int N, int H,
     }
 }
 
-// ─── Активации ────────────────────────────────────────────────
 inline void silu_inplace(float* x, int n) {
     for (int i = 0; i < n; ++i) {
         const float v = x[i];
@@ -116,16 +112,15 @@ inline void softmax_inplace(float* x, int n) {
     for (int i = 0; i < n; ++i) x[i] *= inv;
 }
 
-// ─── RoPE ─────────────────────────────────────────────────────
-inline void apply_rope(float* vec, int offset, int head_dim, int position) {
+inline void apply_rope(float* vec, size_t offset, int head_dim, int position) {
     if (position < 0 || position >= kMaxRopePos)
         throw std::runtime_error("apply_rope: position out of range");
 
-    const int half = head_dim / 2;
+    const size_t half = static_cast<size_t>(head_dim) / 2;
     const RopeCache& c = rope_cache();
     const float* cos_row = c.cos_tab[position];
     const float* sin_row = c.sin_tab[position];
-    for (int i = 0; i < half; ++i) {
+    for (size_t i = 0; i < half; ++i) {
         const float x0 = vec[offset + i];
         const float x1 = vec[offset + i + half];
         vec[offset + i] = x0 * cos_row[i] - x1 * sin_row[i];

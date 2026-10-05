@@ -24,15 +24,12 @@
 #endif
 
 namespace ui {
+    inline constexpr const char* U_VBAR = "\xE2\x96\x8C";
+    inline constexpr const char* U_MIDDOT = "\xC2\xB7";
+    inline constexpr const char* U_TL = "\xE2\x94\x8C";
+    inline constexpr const char* U_BL = "\xE2\x94\x94";
+    inline constexpr const char* U_V = "\xE2\x94\x82";
 
-    // ── Глифы ────────────────────────────────────────────────────
-    inline constexpr const char* U_VBAR = "\xE2\x96\x8C"; // ▌
-    inline constexpr const char* U_MIDDOT = "\xC2\xB7";     // ·
-    inline constexpr const char* U_TL = "\xE2\x94\x8C"; // ┌
-    inline constexpr const char* U_BL = "\xE2\x94\x94"; // └
-    inline constexpr const char* U_V = "\xE2\x94\x82"; // │
-
-    // ── Цвета. Инициализируются пустыми строками (безопасно до init()). ──
     inline const char* RESET = "";
     inline const char* BOLD = "";
     inline const char* DIM = "";
@@ -53,8 +50,8 @@ namespace ui {
 #ifdef _WIN32
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
-        _setmode(_fileno(stdout), _O_BINARY);
-        _setmode(_fileno(stderr), _O_BINARY);
+        (void)_setmode(_fileno(stdout), _O_BINARY);
+        (void)_setmode(_fileno(stderr), _O_BINARY);
         HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode = 0;
         if (hOut && hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode))
@@ -80,10 +77,8 @@ namespace ui {
             MUTED = "\x1b[38;2;88;91;112m";
             TEXT = "\x1b[38;2;205;214;244m";
         }
-        // Иначе — остаются "" из объявления выше.
     }
 
-    // ── banner / prompt ─────────────────────────────────────────
     inline void banner(const std::string& model_name) {
         std::fputc('\n', stdout);
         std::fprintf(stdout, "  %sairun%s  %s·%s  %s%s%s\n",
@@ -101,8 +96,6 @@ namespace ui {
         std::fflush(stdout);
     }
 
-    // ── Стриминг сообщений с подсветкой код блоков ──────────────
-        // ── Стриминг сообщений с подсветкой код блоков ──────────────
     namespace detail {
         struct StreamState {
             bool in_code = false;
@@ -116,10 +109,6 @@ namespace ui {
             return true;
         }
 
-        // Длина (в байтах) начальной части `s`, которая состоит из
-        // ПОЛНЫХ UTF-8 codepoint'ов. Если в хвосте `s` остался неполный
-        // multi-byte символ, возвращает индекс, с которого начинается
-        // этот неполный хвост — вызывающий должен придержать flush.
         inline size_t utf8_complete_len(const std::string& s) {
             size_t i = 0;
             while (i < s.size()) {
@@ -129,7 +118,7 @@ namespace ui {
                 else if ((b & 0xE0) == 0xC0) need = 2;
                 else if ((b & 0xF0) == 0xE0) need = 3;
                 else if ((b & 0xF8) == 0xF0) need = 4;
-                else return i;   // невалидный lead byte — стоп
+                else return i;
                 if (i + static_cast<size_t>(need) > s.size()) return i;
                 i += static_cast<size_t>(need);
             }
@@ -218,7 +207,6 @@ namespace ui {
         std::fflush(stdout);
     }
 
-    // ── think ────────────────────────────────────────────────────
     inline void ai_msg_think_begin() {
         std::fprintf(stdout, "%s%s%s thinking%s\n", MUTED, ITALIC, U_MIDDOT, RESET);
         std::fflush(stdout);
@@ -234,7 +222,6 @@ namespace ui {
         std::fflush(stdout);
     }
 
-    // ── Уведомления ──────────────────────────────────────────────
     inline void notice(const std::string& msg) {
         std::fprintf(stdout, "%s%s%s\n", YELLOW, msg.c_str(), RESET);
         std::fflush(stdout);
@@ -251,6 +238,24 @@ namespace ui {
         std::fflush(stdout);
     }
 
+    inline void tool_call_marker(const std::string& body) {
+        std::fprintf(stdout, "\n  %s⚙ tool%s %s%s%s\n",
+            BOLD, RESET, OVERLAY, body.c_str(), RESET);
+        std::fflush(stdout);
+    }
+
+    inline void tool_result(const std::string& name, bool ok, const std::string& text) {
+        const char* color = ok ? TEAL : RED;
+        std::string shown = text;
+        constexpr size_t kMax = 1200;
+        if (shown.size() > kMax) {
+            shown = shown.substr(0, kMax) + "…";
+        }
+        std::fprintf(stdout, "  %s↳ %s%s %s%s\n",
+            color, name.c_str(), ok ? "" : "(error)", shown.c_str(), RESET);
+        std::fflush(stdout);
+    }
+
     inline void help() {
         std::fprintf(stdout, "%s", OVERLAY);
         std::fprintf(stdout,
@@ -259,12 +264,12 @@ namespace ui {
             "  /clear           clear screen and redraw banner\n"
             "  /think           toggle thinking mode\n"
             "  /temp <n>        set sampling temperature\n"
-            "  /help            show this help\n");
+            "  /help            show this help\n"
+            "  /tools           toggle tool calling\n");
         std::fprintf(stdout, "%s", RESET);
         std::fflush(stdout);
     }
 
-    // ── Чтение строки (кросс платформенно) ──────────────────────
     inline bool read_user_line(std::string& out) {
         out.clear();
 #ifdef _WIN32

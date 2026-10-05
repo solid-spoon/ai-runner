@@ -33,8 +33,6 @@ struct ModelConfig {
     }
 };
 
-// Минимальный парсер одного уровня вложенности.
-// Вложенные объекты и массивы пропускаются.
 class JsonParser {
     const std::string& s_;
     size_t i_ = 0;
@@ -122,7 +120,6 @@ private:
             i_ += 4; return;
         }
 
-        // Число
         const size_t start = i_;
         if (i_ < s_.size() && (s_[i_] == '-' || s_[i_] == '+')) ++i_;
         bool is_float = false;
@@ -185,8 +182,6 @@ inline ModelConfig load_model_config(const std::string& path) {
         else if (k == "eos_token_id") cfg.eos_token_id = std::stoi(v);
         });
 
-    // Валидация: все критичные размеры должны быть положительны.
-    // Иначе, например, hidden_size=-1 дойдёт до аллокаций и приведёт к UB.
     if (cfg.hidden_size <= 0 || cfg.num_hidden_layers <= 0 ||
         cfg.vocab_size <= 0 || cfg.num_attention_heads <= 0)
         throw std::runtime_error("config.json missing or invalid required fields");

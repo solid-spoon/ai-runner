@@ -13,7 +13,7 @@ struct SamplerConfig {
     float repetition_penalty = 1.05f;
     int   presence_penalty = 0;
     float frequency_penalty = 0.0f;
-    int   repetition_window = 128;   // учитывать только последние N токенов
+    int   repetition_window = 128;
 };
 
 class Sampler {
@@ -42,12 +42,10 @@ public:
             cfg.presence_penalty == 0 && cfg.frequency_penalty == 0.0f))
             return;
 
-        // Окно: смотрим только на последние repetition_window токенов.
-        // Это ограничивает стоимость и не подавляет слова, встречавшиеся
-        // очень давно в промпте.
-        const int start = (cfg.repetition_window > 0 &&
+        const size_t start = (cfg.repetition_window > 0 &&
             (int)recent.size() > cfg.repetition_window)
-            ? (int)recent.size() - cfg.repetition_window : 0;
+            ? static_cast<size_t>(recent.size() - static_cast<size_t>(cfg.repetition_window))
+            : size_t{ 0 };
 
         recent_buf_.assign(recent.begin() + start, recent.end());
         std::sort(recent_buf_.begin(), recent_buf_.end());
@@ -80,7 +78,7 @@ public:
         const std::vector<int>& recent_tokens) {
         ensure_capacity(vocab_size);
 
-        std::memcpy(probs_.data(), logits, vocab_size * sizeof(float));
+        std::memcpy(probs_.data(), logits, static_cast<size_t>(vocab_size) * sizeof(float));
         apply_penalties(probs_.data(), vocab_size, recent_tokens, cfg);
 
         if (cfg.temperature <= 1e-5f) {
@@ -101,20 +99,16 @@ public:
         float inv_sum = 1.0f / sum;
         for (int i = 0; i < vocab_size; ++i) probs_[i] *= inv_sum;
 
-        // Ограничиваем кандидатов, чтобы не сортировать весь словарь (150k+).
-        // Если top_k не задан, берем лимит 2048, этого хватит для любого top_p.
         int max_candidates = (cfg.top_k > 0 && cfg.top_k < vocab_size) ? cfg.top_k : 2048;
         if (max_candidates > vocab_size) max_candidates = vocab_size;
 
         std::iota(indices_.data(), indices_.data() + vocab_size, 0);
-
-        // O(N) поиск top-K кандидатов
         std::nth_element(indices_.data(), indices_.data() + max_candidates,
             indices_.data() + vocab_size,
             [&](int a, int b) { return probs_[a] > probs_[b]; });
 
         if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
-            // Сортируем только отобранных кандидатов O(K log K)
+
             std::sort(indices_.data(), indices_.data() + max_candidates,
                 [&](int a, int b) { return probs_[a] > probs_[b]; });
 
@@ -144,6 +138,6 @@ public:
             cum += probs_[indices_[i]];
             if (cum >= r) return indices_[i];
         }
-        return indices_[max_candidates - 1];
+        return indices_[static_cast<size_t>(max_candidates) - 1];
     }
 };

@@ -12,7 +12,6 @@
 #include <fstream>
 #include <sstream>
 
-// ─── UTF-8 helpers ─────────────────────────────────────────
 inline std::string utf8_encode(uint32_t cp) {
     std::string out;
     if (cp < 0x80) {
@@ -64,7 +63,6 @@ inline bool is_whitespace_cp(uint32_t cp) {
         cp == 0x0B || cp == 0x0C;
 }
 
-// ─── GPT-2 style byte-to-unicode mapping ──────────────────
 inline const std::vector<std::pair<uint8_t, uint32_t>>& byte_uni_table() {
     static std::vector<std::pair<uint8_t, uint32_t>> table;
     if (!table.empty()) return table;
@@ -82,7 +80,6 @@ inline const std::vector<std::pair<uint8_t, uint32_t>>& byte_uni_table() {
     return table;
 }
 
-// ─── Vocab / merges loaders ────────────────────────────────
 inline std::unordered_map<std::string, int>
 parse_vocab_json(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -124,7 +121,6 @@ parse_vocab_json(const std::string& path) {
                         else if (h >= 'A' && h <= 'F') cp |= (h - 'A' + 10);
                     }
                     i += 4;
-                    // Фикс суррогатных пар: \uD83D\uDE00 должен стать одним кодом.
                     if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < n &&
                         s[i + 1] == '\\' && s[i + 2] == 'u') {
                         uint32_t cp2 = 0;
@@ -202,7 +198,6 @@ parse_merges_txt(const std::string& path) {
     return out;
 }
 
-// ─── Tokenizer ─────────────────────────────────────────────
 class Qwen2Tokenizer {
 public:
     Qwen2Tokenizer(const std::string& vocab_path,
@@ -289,7 +284,6 @@ private:
     std::string byte_to_uni_[256];
     std::unordered_map<uint32_t, uint8_t> uni_to_byte_;
 
-    // Один сегмент между спешиалами. Работает без подстрок на каждый кусок.
     void append_segment(const std::string& text, size_t off, size_t len,
         std::vector<int>& ids) const {
         const std::string seg = text.substr(off, len);
@@ -312,7 +306,6 @@ private:
         size_t i = 0;
         const size_t n = text.size();
         while (i < n) {
-            // 1. Контракция ('s, 't, 're, 've, 'll, ...)
             if (text[i] == '\'') {
                 int matched = 0;
                 if (i + 1 < n) {
@@ -326,7 +319,6 @@ private:
                 }
                 if (matched > 0) { pieces.push_back({ i, (size_t)matched }); i += matched; continue; }
             }
-            // 2. Запуск букв, либо пунктуация+буквы.
             {
                 const auto cl = utf8_decode(text, i);
                 if (is_letter_cp(cl.first)) {
@@ -354,12 +346,10 @@ private:
                     }
                 }
             }
-            // 3. Одиночная цифра.
             {
                 const auto cl = utf8_decode(text, i);
                 if (is_digit_cp(cl.first)) { pieces.push_back({ i, (size_t)cl.second }); i += cl.second; continue; }
             }
-            // 4. Пробел+пунктуация, либо чистая пунктуация.
             {
                 size_t j = i; bool ok = false;
                 if (text[i] == ' ') {
@@ -389,7 +379,6 @@ private:
                     pieces.push_back({ i, k - i }); i = k; continue;
                 }
             }
-            // 5. Пробельный чанк.
             {
                 const auto cl = utf8_decode(text, i);
                 if (is_whitespace_cp(cl.first)) {

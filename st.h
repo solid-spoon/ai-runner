@@ -146,19 +146,16 @@ private:
     }
 
     void parse() {
+        constexpr size_t kHeaderSize = 8;
         uint64_t header_len;
-        std::memcpy(&header_len, base_, 8);
-        if (header_len > mmap_size_ - 8)
+        std::memcpy(&header_len, base_, kHeaderSize);
+        if (header_len > mmap_size_ - kHeaderSize)
             throw std::runtime_error("safetensors header_len exceeds file size");
 
-        const std::string h(reinterpret_cast<const char*>(base_) + 8,
+        const std::string h(reinterpret_cast<const char*>(base_) + kHeaderSize,
             static_cast<size_t>(header_len));
-        const uint8_t* data_base = base_ + 8 + header_len;
-
-        // Доступное число байт после заголовка. Считаем через вычитание,
-        // чтобы не полагаться на указательную арифметику с size_t, которая
-        // может переполниться на специально сконструированном файле.
-        const size_t avail = mmap_size_ - 8 - static_cast<size_t>(header_len);
+        const uint8_t* data_base = base_ + kHeaderSize + static_cast<size_t>(header_len);
+        const size_t avail = mmap_size_ - kHeaderSize - static_cast<size_t>(header_len);
 
         size_t i = 0;
         auto skip_ws = [&]() {
@@ -252,7 +249,6 @@ private:
                         skip_ws();
                         if (h[i] == ']') { ++i; break; }
 
-                        // Фикс бесконечного цикла: проверяем что символ - цифра
                         if (h[i] < '0' || h[i] > '9') {
                             throw std::runtime_error("invalid character in shape at " + std::to_string(i));
                         }
@@ -274,7 +270,6 @@ private:
                         skip_ws();
                         if (h[i] == ']') { ++i; break; }
 
-                        // Фикс бесконечного цикла
                         if (h[i] < '0' || h[i] > '9') {
                             throw std::runtime_error("invalid character in data_offsets at " + std::to_string(i));
                         }
@@ -302,8 +297,6 @@ private:
                 throw std::runtime_error("tensor '" + t.name + "' missing dtype");
             if (t.offset_end < t.offset_begin)
                 throw std::runtime_error("tensor '" + t.name + "' has inverted data_offsets");
-            // Проверяем через avail: смещение не может превышать
-            // размер данных после заголовка.
             if (t.offset_end > avail)
                 throw std::runtime_error("tensor '" + t.name + "' data_offsets exceed file size");
 

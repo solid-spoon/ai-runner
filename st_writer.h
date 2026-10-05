@@ -41,8 +41,6 @@ public:
     void add_f32(const std::string& name,
         const std::vector<int64_t>& shape,
         const float* data, size_t n) {
-        // ѕроверка: shape и n должны совпадать, иначе запишем тензор
-        // с неверными data_offsets и safetensors его отвергнет.
         if ((size_t)numel_of(shape) != n)
             throw std::runtime_error("add_f32: shape/numel mismatch for " + name);
 

@@ -35,10 +35,8 @@ public:
     std::vector<float> kv_k_flat, kv_v_flat;
     int kv_len_ = 0;
 
-    // single-token scratch
     std::vector<float> x, xNorm, q, k, v, attnOut, oProj, gate, up, mlp;
     std::vector<float> logits, scores;
-    // batch scratch
     std::vector<float> Xb, Xnb, Qb, Kb, Vb, AttnOutb, OProjb;
     std::vector<float> Gateb, Upb, Mlb, scores_buf;
 
@@ -123,7 +121,7 @@ public:
             }
         }
 
-        const size_t kv_size = (size_t)NL * kMaxContext * KVD;
+        const size_t kv_size = static_cast<size_t>(NL) * kMaxContext * KVD;
         std::fprintf(stderr, "[model] weights loaded, KV cache %.1f MB\n",
             (double)kv_size * 8 / 1e6);
         kv_k_flat.assign(kv_size, 0.0f);
@@ -137,35 +135,35 @@ public:
         scores.assign(kMaxContext, 0);
         scores_buf.assign(kMaxContext, 0);
 
-        Xb.assign((size_t)kMaxPrefill * H, 0);
-        Xnb.assign((size_t)kMaxPrefill * H, 0);
-        Qb.assign((size_t)kMaxPrefill * Q_DIM, 0);
-        Kb.assign((size_t)kMaxPrefill * KVD, 0);
-        Vb.assign((size_t)kMaxPrefill * KVD, 0);
-        AttnOutb.assign((size_t)kMaxPrefill * Q_DIM, 0);
-        OProjb.assign((size_t)kMaxPrefill * H, 0);
-        Gateb.assign((size_t)kMaxPrefill * INTER, 0);
-        Upb.assign((size_t)kMaxPrefill * INTER, 0);
-        Mlb.assign((size_t)kMaxPrefill * H, 0);
+        const size_t pre = static_cast<size_t>(kMaxPrefill);
+        Xb.assign(pre * static_cast<size_t>(H), 0);
+        Xnb.assign(pre * static_cast<size_t>(H), 0);
+        Qb.assign(pre * static_cast<size_t>(Q_DIM), 0);
+        Kb.assign(pre * static_cast<size_t>(KVD), 0);
+        Vb.assign(pre * static_cast<size_t>(KVD), 0);
+        AttnOutb.assign(pre * static_cast<size_t>(Q_DIM), 0);
+        OProjb.assign(pre * static_cast<size_t>(H), 0);
+        Gateb.assign(pre * static_cast<size_t>(INTER), 0);
+        Upb.assign(pre * static_cast<size_t>(INTER), 0);
+        Mlb.assign(pre * static_cast<size_t>(H), 0);
     }
 
     void reset_kv() { kv_len_ = 0; }
     int kv_len() const { return kv_len_; }
 
     inline float* k_at(int li, int t) {
-        return kv_k_flat.data() + ((size_t)li * kMaxContext + t) * KVD;
+        return kv_k_flat.data() + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
     }
     inline float* v_at(int li, int t) {
-        return kv_v_flat.data() + ((size_t)li * kMaxContext + t) * KVD;
+        return kv_v_flat.data() + (static_cast<size_t>(li) * kMaxContext + t) * KVD;
     }
 
     inline void embed_lookup(int token_id, float* out) const {
-        const int8_t* row = embed.data.data() + (size_t)token_id * H;
+        const int8_t* row = embed.data.data() + static_cast<size_t>(token_id) * H;
         const float sc = embed.scales[token_id];
         for (int i = 0; i < H; ++i) out[i] = (float)row[i] * sc;
     }
 
-    // Single-token decode. Caller must ensure kv_len_ < kMaxContext.
     const float* forward(int token_id) {
         if (kv_len_ >= kMaxContext)
             throw std::runtime_error("KV cache full; call reset_kv() first");
@@ -183,28 +181,34 @@ public:
                 L.v_b.empty() ? nullptr : L.v_b.data(), v.data(), KVD);
 
             if (cfg.use_qk_norm) {
-                for (int h = 0; h < NH; ++h)
-                    rms_norm(q.data() + h * HD, L.q_norm.data(), HD, RMS_EPS, q.data() + h * HD);
-                for (int h = 0; h < NKV; ++h)
-                    rms_norm(k.data() + h * HD, L.k_norm.data(), HD, RMS_EPS, k.data() + h * HD);
+                for (int h = 0; h < NH; ++h) {
+                    const size_t off = static_cast<size_t>(h) * HD;
+                    rms_norm(q.data() + off, L.q_norm.data(), HD, RMS_EPS, q.data() + off);
+                }
+                for (int h = 0; h < NKV; ++h) {
+                    const size_t off = static_cast<size_t>(h) * HD;
+                    rms_norm(k.data() + off, L.k_norm.data(), HD, RMS_EPS, k.data() + off);
+                }
             }
-            for (int h = 0; h < NH; ++h) apply_rope(q.data(), h * HD, HD, pos);
-            for (int h = 0; h < NKV; ++h) apply_rope(k.data(), h * HD, HD, pos);
+            for (int h = 0; h < NH; ++h)
+                apply_rope(q.data(), static_cast<size_t>(h) * HD, HD, pos);
+            for (int h = 0; h < NKV; ++h)
+                apply_rope(k.data(), static_cast<size_t>(h) * HD, HD, pos);
 
             std::memcpy(k_at(li, pos), k.data(), KVD * sizeof(float));
             std::memcpy(v_at(li, pos), v.data(), KVD * sizeof(float));
 
             const int seq_len = pos + 1;
             const float scale = 1.0f / std::sqrt((float)HD);
-            const float* kbase = kv_k_flat.data() + (size_t)li * kMaxContext * KVD;
-            const float* vbase = kv_v_flat.data() + (size_t)li * kMaxContext * KVD;
+            const float* kbase = kv_k_flat.data() + static_cast<size_t>(li) * kMaxContext * KVD;
+            const float* vbase = kv_v_flat.data() + static_cast<size_t>(li) * kMaxContext * KVD;
 
             for (int h = 0; h < NH; ++h) {
                 const int kv_head = h / GROUPS;
                 const int q_off = h * HD;
                 const int kv_off = kv_head * HD;
                 for (int t = 0; t < seq_len; ++t) {
-                    const float* kt = kbase + (size_t)t * KVD + kv_off;
+                    const float* kt = kbase + static_cast<size_t>(t) * KVD + kv_off;
                     float s = 0.0f;
                     for (int d = 0; d < HD; ++d) s += q[q_off + d] * kt[d];
                     scores[t] = s * scale;
@@ -213,7 +217,7 @@ public:
                 for (int d = 0; d < HD; ++d) {
                     float s = 0.0f;
                     for (int t = 0; t < seq_len; ++t)
-                        s += scores[t] * vbase[(size_t)t * KVD + kv_off + d];
+                        s += scores[t] * vbase[static_cast<size_t>(t) * KVD + kv_off + d];
                     attnOut[q_off + d] = s;
                 }
             }
@@ -237,7 +241,6 @@ public:
         return logits.data();
     }
 
-    // Batched prefill. Caller must ensure kv_len_ + N <= kMaxContext.
     const float* forward_batch(const std::vector<int>& tokens) {
         const int N = (int)tokens.size();
         if (N == 0) return logits.data();
@@ -248,7 +251,7 @@ public:
 
         const int past_len = kv_len_;
         for (int t = 0; t < N; ++t)
-            embed_lookup(tokens[t], Xb.data() + (size_t)t * H);
+            embed_lookup(tokens[t], Xb.data() + static_cast<size_t>(t) * H);
 
         for (int li = 0; li < NL; ++li) {
             Layer& L = layers[li];
@@ -262,40 +265,48 @@ public:
 
             if (cfg.use_qk_norm) {
                 for (int t = 0; t < N; ++t) {
-                    float* qrow = Qb.data() + (size_t)t * Q_DIM;
-                    for (int h = 0; h < NH; ++h)
-                        rms_norm(qrow + h * HD, L.q_norm.data(), HD, RMS_EPS, qrow + h * HD);
-                    float* krow = Kb.data() + (size_t)t * KVD;
-                    for (int h = 0; h < NKV; ++h)
-                        rms_norm(krow + h * HD, L.k_norm.data(), HD, RMS_EPS, krow + h * HD);
+                    float* qrow = Qb.data() + static_cast<size_t>(t) * Q_DIM;
+                    for (int h = 0; h < NH; ++h) {
+                        const size_t off = static_cast<size_t>(h) * HD;
+                        rms_norm(qrow + off, L.q_norm.data(), HD, RMS_EPS, qrow + off);
+                    }
+                    float* krow = Kb.data() + static_cast<size_t>(t) * KVD;
+                    for (int h = 0; h < NKV; ++h) {
+                        const size_t off = static_cast<size_t>(h) * HD;
+                        rms_norm(krow + off, L.k_norm.data(), HD, RMS_EPS, krow + off);
+                    }
                 }
             }
             for (int t = 0; t < N; ++t) {
                 const int pos = past_len + t;
+                const size_t tq = static_cast<size_t>(t) * Q_DIM;
+                const size_t tk = static_cast<size_t>(t) * KVD;
                 for (int h = 0; h < NH; ++h)
-                    apply_rope(Qb.data(), t * Q_DIM + h * HD, HD, pos);
+                    apply_rope(Qb.data(), tq + static_cast<size_t>(h) * HD, HD, pos);
                 for (int h = 0; h < NKV; ++h)
-                    apply_rope(Kb.data(), t * KVD + h * HD, HD, pos);
+                    apply_rope(Kb.data(), tk + static_cast<size_t>(h) * HD, HD, pos);
             }
             for (int t = 0; t < N; ++t) {
-                std::memcpy(k_at(li, past_len + t), Kb.data() + (size_t)t * KVD, KVD * sizeof(float));
-                std::memcpy(v_at(li, past_len + t), Vb.data() + (size_t)t * KVD, KVD * sizeof(float));
+                std::memcpy(k_at(li, past_len + t),
+                    Kb.data() + static_cast<size_t>(t) * KVD, KVD * sizeof(float));
+                std::memcpy(v_at(li, past_len + t),
+                    Vb.data() + static_cast<size_t>(t) * KVD, KVD * sizeof(float));
             }
 
             const float scale = 1.0f / std::sqrt((float)HD);
             float* sc = scores_buf.data();
-            const float* kbase = kv_k_flat.data() + (size_t)li * kMaxContext * KVD;
-            const float* vbase = kv_v_flat.data() + (size_t)li * kMaxContext * KVD;
+            const float* kbase = kv_k_flat.data() + static_cast<size_t>(li) * kMaxContext * KVD;
+            const float* vbase = kv_v_flat.data() + static_cast<size_t>(li) * kMaxContext * KVD;
 
             for (int h = 0; h < NH; ++h) {
                 const int kv_head = h / GROUPS;
                 const int q_off = h * HD;
                 const int kv_off = kv_head * HD;
                 for (int t1 = 0; t1 < N; ++t1) {
-                    const float* qrow = Qb.data() + (size_t)t1 * Q_DIM + q_off;
+                    const float* qrow = Qb.data() + static_cast<size_t>(t1) * Q_DIM + q_off;
                     const int cnt = past_len + t1 + 1;
                     for (int t2 = 0; t2 < cnt; ++t2) {
-                        const float* krow = kbase + (size_t)t2 * KVD + kv_off;
+                        const float* krow = kbase + static_cast<size_t>(t2) * KVD + kv_off;
                         __m128 sum = _mm_setzero_ps();
                         int d = 0;
                         for (; d + 4 <= HD; d += 4) {
@@ -308,11 +319,11 @@ public:
                         sc[t2] = s * scale;
                     }
                     softmax_inplace(sc, cnt);
-                    float* orow = AttnOutb.data() + (size_t)t1 * Q_DIM + q_off;
+                    float* orow = AttnOutb.data() + static_cast<size_t>(t1) * Q_DIM + q_off;
                     for (int d = 0; d < HD; ++d) orow[d] = 0.0f;
                     for (int t2 = 0; t2 < cnt; ++t2) {
                         const float w = sc[t2];
-                        const float* vrow = vbase + (size_t)t2 * KVD + kv_off;
+                        const float* vrow = vbase + static_cast<size_t>(t2) * KVD + kv_off;
                         for (int d = 0; d < HD; ++d) orow[d] += w * vrow[d];
                     }
                 }
@@ -330,7 +341,7 @@ public:
         }
 
         rms_norm_batch(Xb.data(), N, H, finalNorm.data(), RMS_EPS, Xnb.data());
-        const float* last_xn = Xnb.data() + (size_t)(N - 1) * H;
+        const float* last_xn = Xnb.data() + (static_cast<size_t>(N) - 1) * H;
         const Int8Tensor& head = cfg.tie_word_embeddings ? embed : lm_head;
         matvec_int8_parallel(last_xn, H, head, nullptr, logits.data(), VOCAB);
         kv_len_ += N;
