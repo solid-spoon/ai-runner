@@ -1,4 +1,3 @@
-﻿// test_airun.cpp
 #include "mini_test.h"
 MINITEST_MAIN
 
@@ -23,8 +22,6 @@ MINITEST_MAIN
 #include "st.h"
 #include "tools.h"
 
-// ============================== helpers ==============================
-
 namespace {
 
     std::vector<float> make_random_vec(size_t n, uint32_t seed = 42) {
@@ -35,7 +32,6 @@ namespace {
         return v;
     }
 
-    // Fixture for anything touching the filesystem.
     class FileFixture : public ::testing::Test {
     protected:
         void SetUp() override {
@@ -52,8 +48,6 @@ namespace {
     };
 
 } // namespace
-
-// ================================ quant.h ============================
 
 TEST(QuantizePerChannel, ZeroMatrix_Handled) {
     std::vector<float> W(6, 0.0f);
@@ -170,8 +164,6 @@ TEST(MatvecInt8Parallel, MatchesSequential) {
     for (int i = 0; i < out_dim; ++i) EXPECT_FLOAT_EQ(seq[i], par[i]);
 }
 
-// ================================ matmul.h ===========================
-
 TEST(RmsNorm, OnesEpsZero_Identity) {
     std::vector<float> x = { 1,1,1,1 }, g = { 1,1,1,1 }, out(4, 0.f);
     rms_norm(x.data(), g.data(), 4, 0.0f, out.data());
@@ -256,8 +248,6 @@ TEST(NumThreads, AtLeastOne) {
     EXPECT_GE(num_threads(), 1);
 }
 
-// ================================ sampler.h ==========================
-
 TEST(Sampler, TempZero_Argmax) {
     Sampler s; SamplerConfig c; c.temperature = 0.0f;
     std::vector<float> logits = { 1.f, 5.f, -3.f, 2.f };
@@ -316,8 +306,6 @@ TEST(Sampler, FrequencyPenalty_MultipliesByCount) {
     EXPECT_FLOAT_EQ(logits[1], 5.0f);
 }
 
-// ================================ tokenizer.h ========================
-
 TEST(Utf8, EncodeDecode_RoundTrip) {
     for (uint32_t cp : {0x41u, 0x7Au, 0xE9u, 0x2603u, 0x4E2Du, 0x1F600u}) {
         const std::string s = utf8_encode(cp);
@@ -372,8 +360,6 @@ TEST_F(FileFixture, ParseMerges_RanksIncreasing) {
     EXPECT_LT(m.at("b c"), m.at("c d"));
 }
 
-// ================================ config.h ===========================
-
 TEST(JsonParser, NumbersStrings_Basic) {
     std::string s = R"({"a": 42, "b": "hello", "c": 3.14, "d": true})";
     std::map<std::string, std::pair<std::string, std::string>> got;
@@ -404,8 +390,6 @@ TEST(JsonParser, MissingBrace_Throws) {
     EXPECT_THROW(p.parse_top_object([](auto&, auto&, auto&) {}),
         std::runtime_error);
 }
-
-// ================================ tools.h ============================
 
 TEST(ToolsJson, ParsesStringArg) {
     std::string s = R"({"path": "a/b.txt"})";
@@ -504,8 +488,6 @@ TEST_F(FileFixture, ToolsExecute_UnknownTool_Fails) {
     auto r = tools::execute(cfg, c);
     EXPECT_FALSE(r.ok);
 }
-
-// ================================ st_writer.h ========================
 
 TEST_F(FileFixture, SafeTensorsWriter_F32_RoundTrip) {
     auto p = (dir / "w.safetensors").string();
