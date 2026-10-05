@@ -14,10 +14,6 @@
 
 struct ChatTurn { std::string role, text; };
 
-// ---------------------------------------------------------------------------
-// System prompt builder
-// ---------------------------------------------------------------------------
-
 inline const char* kSystemAgentZH =
 "你是一个自主的文件与编码代理。你在沙箱（当前工作目录）中工作。\n"
 "通过调用工具来完成任务，不要用自然语言描述工具调用。\n\n"
@@ -68,10 +64,6 @@ inline std::string build_system(const tools::Config& tc) {
     if (!tc.enabled) return std::string(kSystemChatZH);
     return std::string(kSystemAgentZH) + tools::describe(tc);
 }
-
-// ---------------------------------------------------------------------------
-// Agent
-// ---------------------------------------------------------------------------
 
 class QwenAgent {
 public:
@@ -124,7 +116,6 @@ public:
     }
 
 private:
-    // Keep at most 12 turns; never leave a dangling "tool" at the front.
     void trim_history() {
         while (history_.size() > 12) {
             history_.erase(history_.begin());
@@ -267,10 +258,6 @@ private:
     int think_open_ = -1, think_close_ = -1;
     bool enable_think_ = false;
 };
-
-// ---------------------------------------------------------------------------
-// REPL
-// ---------------------------------------------------------------------------
 
 inline void apply_agent_sampler(QwenAgent& agent) {
     SamplerConfig sc;
